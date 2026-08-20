@@ -281,8 +281,10 @@ same block; a provider that ignores it leaves the counts `None`.
 in `models.json` and cost is computed at *export* time, so correcting a price
 and re-exporting fixes every trial already on disk.
 
-Output and cached counts require kernel commit `<TBD>` or later — before that
-the kernel published only `prompt_tokens`. `kernel_commit` is on every trial
+Output and cached counts require kernel commit `f72435fe` (with store commit
+`95afb0bc`) or later. Before those, the kernel published only
+`prompt_tokens`, so trials recorded earlier carry `output_tokens = NULL` and
+`tokens_complete = 0`. `kernel_commit` is on every trial
 row, so old and new trials are separable rather than silently averaged.
 
 ## The database
