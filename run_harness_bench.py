@@ -970,8 +970,15 @@ def summarize(run_dir: Path, task_ids: list[str]) -> dict[str, Any]:
         "completed": sum(1 for row in rows if row.get("state") == "complete"),
         "harness_errors": sum(1 for row in rows if row.get("state") == "harness_error"),
         "provider_unavailable": sum(1 for row in rows if row.get("state") == "provider_unavailable"),
+        # Progress over the *scheduled* set: a task not yet reached counts as
+        # zero here on purpose, because this number answers "how far through
+        # the planned work are we". The database's ``config_scores`` answers
+        # the different question of how well the attempted tasks went and
+        # excludes unrun ones. Reporting ``attempted`` beside the score is
+        # what keeps the two from being mistaken for each other.
         "completion_score": round(statistics.mean(scores), 6) if scores else None,
         "score_denominator": len(task_ids),
+        "attempted": sum(1 for row in rows if row.get("state")),
         "completed_without_oracle_score": unscored,
         # ``input_tokens_billed`` is the sum of each call's whole prompt --
         # what the provider charges for -- and not the context size. A total

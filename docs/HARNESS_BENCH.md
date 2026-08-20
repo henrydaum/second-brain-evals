@@ -128,9 +128,19 @@ general, and a published delta must say which of the two it is.
 
 Two further caveats worth carrying with the number:
 
-- Read-only shell is classified `SAFE` by `sandbox/shell.py`, so `ls`, `cat`
-  and `git status` cost nothing in any mode. An approval count is already a
-  count of consequential acts.
+- Read-only shell is narrower than it sounds. `sandbox/shell.py` classifies
+  `git status`, `git log`, `git diff` and similar as `SAFE`, but **`ls` and
+  `cat` are deliberately excluded** — the kernel's own comment says
+  `sdk.fs.read`/`sdk.fs.list` "do these mediated and better. A dialog is the
+  right nudge toward the SDK." So under `lockdown` the agent cannot list a
+  directory with the shell. Observed in practice: `proc.run: denied: run
+  shell command: ls -la ...`, six times in one run. The mode delta therefore
+  includes basic filesystem inspection, not only consequential acts, and it
+  is a design choice about steering rather than a security necessity.
+- **Lockdown's cost does not appear as approval denials.** A standing refusal
+  never raises a dialog, so `approvals_denied` is zero and the refusals land
+  in `tool_errors` and `driver_rounds.ledger_refused` instead. A comparison
+  that counts denials to measure the security cost will measure nothing.
 - `net_allowed_hosts` is empty in the benchmark template, so the tasks that
   stand up a local HTTP service raise a `net.http` dialog. Those are approved
   under `yolo`, refused under `lockdown`, and — because the manifest declares

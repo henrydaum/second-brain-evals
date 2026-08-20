@@ -752,3 +752,123 @@ def test_a_missing_profile_record_is_not_agreement(tmp_path: Path) -> None:
             connection.execute("SELECT validity_flags FROM trials").fetchone()[0] or "")
     finally:
         connection.close()
+
+
+# -- scheduled but never run ------------------------------------------
+
+def test_a_task_that_never_ran_is_not_a_failure(tmp_path: Path) -> None:
+    """The headline score must not be deflated by work that has not happened.
+
+    This is the shape the corpus is in most of the time: the suite is run in
+    pieces as quota allows, so a job sits paused with most of its tasks
+    unstarted. Counting those as zero made a paused job read as a
+    catastrophic one -- a run with a single perfect task reported 0.33
+    because two more were still scheduled.
+    """
+    run = tmp_path / "runs" / "job-r1"
+    (run / "tasks" / "done").mkdir(parents=True)
+    (run / "run.json").write_text(json.dumps({
+        "run_id": "job-r1", "tasks": ["done", "later1", "later2"],
+        "model": "minimax/MiniMax-M3", "mode": "yolo"}), encoding="utf-8")
+    (run / "tasks" / "done" / "status.json").write_text(json.dumps(
+        {"task_id": "done", "state": "complete", "outcome_score": 1.0}),
+        encoding="utf-8")
+
+    output = tmp_path / "db"
+    export_runs([run], output)
+    connection = sqlite3.connect(output / "harness_bench.sqlite")
+    try:
+        score, tasks, pending = connection.execute(
+            "SELECT completion_score, tasks, not_attempted FROM config_scores").fetchone()
+        rows = connection.execute(
+            "SELECT COUNT(*) FROM trials WHERE attempted = 0").fetchone()[0]
+        flags = connection.execute(
+            "SELECT validity_flags FROM trials WHERE attempted = 0 LIMIT 1").fetchone()[0]
+    finally:
+        connection.close()
+
+    assert score == 1.0                 # not 0.3333
+    assert (tasks, pending) == (1, 2)   # and coverage is stated, not hidden
+    assert rows == 2
+    assert flags == "not_attempted"
+
+
+def test_an_attempted_failure_still_counts_as_zero(tmp_path: Path) -> None:
+    """The denominator rule survives the fix.
+
+    Excluding unrun tasks must not become an excuse that also excludes tasks
+    which ran and failed -- that is precisely the exception the benchmark
+    exists to refuse.
+    """
+    run = tmp_path / "runs" / "job-r1"
+    for task_id, status in (("ok", {"state": "complete", "outcome_score": 1.0}),
+                            ("broke", {"state": "harness_error"}),
+                            ("stopped", {"state": "interrupted"})):
+        folder = run / "tasks" / task_id
+        folder.mkdir(parents=True)
+        (folder / "status.json").write_text(
+            json.dumps({"task_id": task_id, **status}), encoding="utf-8")
+    (run / "run.json").write_text(json.dumps({
+        "run_id": "job-r1", "tasks": ["ok", "broke", "stopped", "never"],
+        "model": "minimax/MiniMax-M3", "mode": "yolo"}), encoding="utf-8")
+
+    output = tmp_path / "db"
+    export_runs([run], output)
+    connection = sqlite3.connect(output / "harness_bench.sqlite")
+    try:
+        score, tasks, pending = connection.execute(
+            "SELECT completion_score, tasks, not_attempted FROM config_scores").fetchone()
+    finally:
+        connection.close()
+
+    # Three attempted (one perfect, two zero), one never started.
+    assert (tasks, pending) == (3, 1)
+    assert score == round(1 / 3, 4)
+
+
+# -- run ids are not LIKE patterns ------------------------------------
+
+def test_re_exporting_one_run_cannot_delete_another(tmp_path: Path) -> None:
+    """``_`` is a single-character wildcard in SQL LIKE.
+
+    Child rows are addressed by a ``run_id/%`` prefix, and run ids are
+    user-supplied through --run-id and job names. Unescaped, re-exporting
+    ``my_run`` also deleted every row belonging to ``myXrun`` -- silently, and
+    only for whoever happened to name two runs that way.
+    """
+    from export_harness_bench_data import like_prefix
+
+    assert like_prefix("my_run") == "my\\_run/%"
+    assert like_prefix("100%") == "100\\%/%"
+
+    def build(name: str, task_id: str) -> Path:
+        run = tmp_path / "runs" / name
+        (run / "tasks" / task_id).mkdir(parents=True)
+        (run / "run.json").write_text(json.dumps(
+            {"run_id": name, "tasks": [task_id], "model": "minimax/MiniMax-M3"}),
+            encoding="utf-8")
+        (run / "tasks" / task_id / "status.json").write_text(json.dumps(
+            {"task_id": task_id, "state": "complete", "outcome_score": 1.0}),
+            encoding="utf-8")
+        (run / "tasks" / task_id / "events.jsonl").write_text(json.dumps(
+            {"source": "llm", "kind": "llm_call", "payload": {"prompt_tokens": 5}}) + "\n",
+            encoding="utf-8")
+        return run
+
+    victim = build("myXrun", "007-session-memory")
+    target = build("my_run", "001-file")
+    output = tmp_path / "db"
+    export_runs([target, victim], output)
+
+    export_runs([target], output, rebuild=True)      # re-export only my_run
+
+    connection = sqlite3.connect(output / "harness_bench.sqlite")
+    try:
+        runs = [row[0] for row in connection.execute(
+            "SELECT DISTINCT run_id FROM trials ORDER BY run_id")]
+        calls = connection.execute("SELECT COUNT(*) FROM model_calls").fetchone()[0]
+    finally:
+        connection.close()
+
+    assert runs == ["myXrun", "my_run"]
+    assert calls == 2                                # neither lost its child rows

@@ -74,6 +74,9 @@ SCHEMA: dict[str, dict[str, str]] = {
         "mode": "TEXT", "model": "TEXT", "profile": "TEXT",
         "kernel_commit": "TEXT", "store_commit": "TEXT",
         "benchmark_commit": "TEXT", "state": "TEXT",
+        # Whether this task was ever actually started. A scheduled-but-unrun
+        # task is not a failure, and must not be averaged as one.
+        "attempted": "INTEGER",
         "outcome_score": "REAL", "score": "REAL", "combined_score": "REAL",
         "adapter_ok": "INTEGER",
         "elapsed_sec": "REAL", "model_time_sec": "REAL", "model_calls": "INTEGER",
@@ -164,10 +167,12 @@ VIEWS = {
                COUNT(*) AS trials,
                ROUND(AVG(score), 4) AS mean_score,
                MIN(score) AS min_score, MAX(score) AS max_score,
+               ROUND(MAX(score) - MIN(score), 4) AS spread,
                ROUND(AVG(CASE WHEN score >= 1.0 THEN 1.0 ELSE 0.0 END), 4) AS pass_rate,
                ROUND(AVG(cost_total_usd), 6) AS mean_cost_usd,
                ROUND(AVG(elapsed_sec), 1) AS mean_elapsed_sec
         FROM trials
+        WHERE attempted = 1
         GROUP BY model, profile, mode, kernel_commit, task_id, difficulty
     """,
     # The headline number. Averaging per task FIRST is load-bearing: a flat
@@ -175,18 +180,24 @@ VIEWS = {
     # outweigh one that was run once, so the score would drift with the
     # scheduling history rather than with the harness.
     "config_scores": """
-        SELECT model, profile, mode, kernel_commit,
+        SELECT r.model, r.profile, r.mode, r.kernel_commit,
                COUNT(*) AS tasks,
-               SUM(trials) AS trials,
-               ROUND(AVG(mean_score), 4) AS completion_score,
-               ROUND(AVG(pass_rate), 4) AS pass_rate,
+               SUM(r.trials) AS trials,
+               ROUND(AVG(r.mean_score), 4) AS completion_score,
+               ROUND(AVG(r.pass_rate), 4) AS pass_rate,
+               -- Coverage, so a partial corpus cannot pass for a finished
+               -- one. The score above is over `tasks`, never over the 106.
+               (SELECT COUNT(*) FROM trials t
+                 WHERE t.model IS r.model AND t.profile IS r.profile
+                   AND t.mode IS r.mode AND t.kernel_commit IS r.kernel_commit
+                   AND t.attempted = 0) AS not_attempted,
                -- Cost of ONE pass over the task set at this configuration:
                -- the per-task mean summed across tasks, not a total over
                -- however many replicates happened to run.
-               ROUND(SUM(mean_cost_usd), 4) AS cost_usd_per_sweep,
-               ROUND(AVG(mean_elapsed_sec), 1) AS mean_elapsed_sec
-        FROM task_reliability
-        GROUP BY model, profile, mode, kernel_commit
+               ROUND(SUM(r.mean_cost_usd), 4) AS cost_usd_per_sweep,
+               ROUND(AVG(r.mean_elapsed_sec), 1) AS mean_elapsed_sec
+        FROM task_reliability r
+        GROUP BY r.model, r.profile, r.mode, r.kernel_commit
     """,
     "trial_efficiency": """
         SELECT trial_id, task_id, difficulty, profile, mode, score, elapsed_sec,
@@ -270,6 +281,24 @@ def fingerprint(run_dir: Path) -> str:
 
 
 # -- cost -------------------------------------------------------------
+
+def like_prefix(run_id: str) -> str:
+    """A LIKE pattern matching exactly this run's trial ids.
+
+    ``_`` and ``%`` are wildcards in LIKE, and a run id is user-supplied
+    (``--run-id``, or a job name). Without escaping, re-exporting a run called
+    ``my_run`` would also delete the rows of ``myXrun`` -- silently, and only
+    for whoever happened to name two runs that way.
+    """
+    escaped = (run_id.replace("\\", "\\\\")
+                     .replace("%", "\\%")
+                     .replace("_", "\\_"))
+    return escaped + "/%"
+
+
+#: Passed alongside :func:`like_prefix` so SQLite honours its escapes.
+LIKE_ESCAPE = " ESCAPE '\\'"
+
 
 def costs(model: str, billed: int | None, cached: int | None, output: int | None,
           prices: dict[str, Any]) -> dict[str, Any]:
@@ -496,9 +525,17 @@ def collect_trial(run_dir: Path, run: dict[str, Any], task_id: str,
     integrity = "n/a" if not integrity_checks else (
         "pass" if all(item.get("pass") for item in integrity_checks) else "fail")
 
+    # **Attempted is not the same as complete, and neither is the same as
+    # failed.** A task the launcher scheduled but never reached has no status
+    # file at all. Scoring it zero and averaging it in makes a paused job read
+    # as a catastrophic one -- and a suite run in pieces across sessions is
+    # paused most of the time it exists.
+    attempted = bool(status.get("state"))
     flags = []
-    if status.get("state") != "complete":
-        flags.append(str(status.get("state") or "unknown_state"))
+    if not attempted:
+        flags.append("not_attempted")
+    elif status.get("state") != "complete":
+        flags.append(str(status.get("state")))
     if status.get("adapter_ok") is False:
         flags.append("adapter_failed")
     if integrity == "fail":
@@ -547,7 +584,8 @@ def collect_trial(run_dir: Path, run: dict[str, Any], task_id: str,
         "kernel_commit": effective.get("kernel_commit") or template.get("kernel_commit"),
         "store_commit": effective.get("store_commit") or template.get("store_commit"),
         "benchmark_commit": run.get("benchmark_commit"),
-        "state": status.get("state"), "outcome_score": number(status.get("outcome_score")),
+        "state": status.get("state"), "attempted": attempted,
+        "outcome_score": number(status.get("outcome_score")),
         "score": score, "combined_score": number(status.get("combined_score")),
         "adapter_ok": status.get("adapter_ok"),
         "elapsed_sec": number(status.get("elapsed_sec")),
@@ -590,11 +628,34 @@ def collect_trial(run_dir: Path, run: dict[str, Any], task_id: str,
 # -- the database -----------------------------------------------------
 
 def connect(path: Path) -> sqlite3.Connection:
+    """Open the database, creating or widening it to match ``SCHEMA``.
+
+    ``CREATE TABLE IF NOT EXISTS`` does nothing to a table that already
+    exists, so adding a column to ``SCHEMA`` left every existing database one
+    column short and the next export died on ``no such column``. Since the
+    corpus accumulates across sessions and the database is the thing carried
+    forward, additive migration has to be automatic -- the alternative is
+    asking somebody to delete their analysis store every time a column is
+    added, which they will do once and then stop upgrading.
+
+    Only additions are handled, deliberately. Dropping or retyping a column
+    is a rebuild, and ``--rebuild`` against a deleted file is the honest way
+    to do it rather than a migration that silently reinterprets old rows.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path)
     for table, columns in SCHEMA.items():
         spec = ", ".join(f'"{name}" {kind}' for name, kind in columns.items())
         connection.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ({spec})')
+        present = {row[1] for row in
+                   connection.execute(f'PRAGMA table_info("{table}")')}
+        for name, kind in columns.items():
+            if name in present:
+                continue
+            # A PRIMARY KEY cannot be introduced by ALTER, and never needs to
+            # be: the table that owns one already had it at creation.
+            kind = kind.replace(" PRIMARY KEY", "")
+            connection.execute(f'ALTER TABLE "{table}" ADD COLUMN "{name}" {kind}')
     for table in RUN_SCOPED:
         if table == "trials":
             continue
@@ -668,8 +729,8 @@ def export_runs(run_dirs: list[Path], output: Path, *, with_events: bool = False
                                        (run_dir.name,))
                 else:
                     connection.execute(
-                        f'DELETE FROM "{table}" WHERE {key} LIKE ?',
-                        (run_dir.name + "/%",))
+                        f'DELETE FROM "{table}" WHERE {key} LIKE ?' + LIKE_ESCAPE,
+                        (like_prefix(run_dir.name),))
 
             summary = read_json(run_dir / "summary.json") or {}
             job_id, replicate = split_run_id(run_dir.name)
@@ -716,8 +777,9 @@ def export_runs(run_dirs: list[Path], output: Path, *, with_events: bool = False
                 connection.execute('DELETE FROM "trials" WHERE run_id = ?', (run_id,))
                 for table in RUN_SCOPED:
                     if table != "trials":
-                        connection.execute(f'DELETE FROM "{table}" WHERE trial_id LIKE ?',
-                                           (run_id + "/%",))
+                        connection.execute(
+                            f'DELETE FROM "{table}" WHERE trial_id LIKE ?' + LIKE_ESCAPE,
+                            (like_prefix(run_id),))
                 connection.execute('DELETE FROM "runs" WHERE run_id = ?', (run_id,))
                 connection.execute('DELETE FROM "source_runs" WHERE run_id = ?', (run_id,))
             connection.execute("DELETE FROM jobs")
