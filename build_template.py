@@ -1,4 +1,4 @@
-"""Build a golden DATA_DIR from a declaration, so a battery starts identical.
+"""Build a golden data tree from Second Brain's general-purpose Docker image.
 
 The template is the half of a benchmark image that cannot be pip-installed:
 config plus the store packages a profile needs. It is built by *really*
@@ -6,10 +6,9 @@ installing them — the package manager copies from `origin/store` and the
 ledger records the store commit and a SHA per file — so the template carries
 its own provenance rather than a claim about it.
 
-Built inside a Linux container on purpose. A DATA_DIR assembled on Windows
-carries Windows paths, and the store is reached by mounting the repo's git
-directory read-only, which is the only thing that knows what `origin/store`
-means.
+Built inside Linux on purpose.  The main repository's Dockerfile is now the
+single application image; this script builds it at the requested checkout and
+uses its normal one-off-command entrypoint to install the benchmark profile.
 
 No secret is written. Keys arrive at run time through the entrypoint, because
 this directory is about to become an image layer.
@@ -20,13 +19,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-DOCKER = r"C:\Program Files\Docker\Docker\resources\bin\docker.exe"
+DOCKER = os.environ.get(
+    "SB_DOCKER", r"C:\Program Files\Docker\Docker\resources\bin\docker.exe")
+BASE_IMAGE = "second-brain:eval-base"
 
 #: What each profile installs. A benchmark's reported configuration is this
 #: list plus the two commits below it, and nothing else.
@@ -82,7 +84,10 @@ print("MANIFEST", json.dumps(manifest), flush=True)
 
 
 def docker(*args: str, capture: bool = False) -> subprocess.CompletedProcess:
-    return subprocess.run([DOCKER, *args], text=True,
+    env = dict(os.environ)
+    docker_dir = str(Path(DOCKER).resolve().parent)
+    env["PATH"] = docker_dir + os.pathsep + env.get("PATH", "")
+    return subprocess.run([DOCKER, *args], text=True, env=env,
                           capture_output=capture, check=False)
 
 
@@ -92,36 +97,61 @@ def main() -> int:
     parser.add_argument("--repo", default=r"Z:\My Code\Second Brain",
                         help="the kernel checkout whose .git knows the store")
     parser.add_argument("--out", default=str(HERE / "template"))
+    parser.add_argument("--image", default=BASE_IMAGE)
+    parser.add_argument("--skip-image-build", action="store_true")
     options = parser.parse_args()
 
     spec = PROFILES[options.profile]
-    out = Path(options.out)
-    if out.exists():
-        shutil.rmtree(out)          # a template is built, never accumulated
-    out.mkdir(parents=True)
-
-    git_dir = Path(options.repo) / ".git"
-    if not git_dir.exists():
-        print(f"no git directory at {git_dir}", file=sys.stderr)
+    out = Path(options.out).resolve()
+    repo = Path(options.repo).resolve()
+    if not (repo / ".git").exists():
+        print(f"no git directory at {repo / '.git'}", file=sys.stderr)
         return 1
+
+    if not options.skip_image_build:
+        print(f"building {options.image} from {repo}", flush=True)
+        built = docker(
+            "build", "--build-arg", "PYTHON_VERSION=3.13",
+            "-t", options.image, str(repo))
+        if built.returncode != 0:
+            print("Second Brain image build failed", file=sys.stderr)
+            return built.returncode
+
+    staging = out.with_name(out.name + ".building")
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
 
     print(f"building '{options.profile}' template into {out}")
     result = docker(
         "run", "--rm",
-        "-v", f"{git_dir}:/app/.git:ro",
-        "-v", f"{out}:/data",
-        "secondbrain:dev", "python", "-c", INSIDE,
+        # Store dependencies are validated during installation, but the
+        # portable seed must not carry one container's Python site-packages.
+        # Keep them off the Windows bind mount entirely.
+        "-e", "PYTHONUSERBASE=/tmp/sb-python",
+        "-v", f"{staging}:/data",
+        options.image, "python", "-c", INSIDE,
         json.dumps(spec["packages"]), json.dumps(spec["autoload_services"]))
     if result.returncode != 0:
         print("template build failed", file=sys.stderr)
         return result.returncode
+
+
+    # Runtime packages are installed once per Harbor environment for that
+    # environment's Python.  Keeping Linux 3.13 site-packages here would make
+    # the supposedly portable seed interpreter-specific.
+    shutil.rmtree(staging / "python", ignore_errors=True)
+    if out.exists():
+        shutil.rmtree(out)
+    staging.replace(out)
 
     manifest = out / "template_manifest.json"
     if manifest.exists():
         print("\n" + manifest.read_text(encoding="utf-8"))
     files = sum(1 for _ in (out / "Second Brain" / "installed").rglob("*.py"))
     print(f"installed python files: {files}")
-    print(f"\nNow: docker build -f Dockerfile.bench -t secondbrain:bench .")
+    print("\nNow: python run_terminal_bench.py --smoke "
+          "terminal-bench/openssl-selfsigned-cert")
     return 0
 
 

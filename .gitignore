@@ -1,4 +1,8 @@
 template/
+.venv/
+.cache/
+build/
+jobs/
 __pycache__/
 *.pyc
 *.env

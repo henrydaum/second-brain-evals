@@ -32,7 +32,8 @@ from driver import collect, turn                        # noqa: E402
 from driver.approver import Approver, Manifest          # noqa: E402
 from driver.wire import Client                          # noqa: E402
 
-TEMPLATE_MANIFEST = "/opt/sb-template/template_manifest.json"
+TEMPLATE_MANIFEST = os.environ.get(
+    "SB_TEMPLATE_MANIFEST", "/opt/sb-template/template_manifest.json")
 
 
 def main(argv=None):
@@ -85,6 +86,7 @@ def main(argv=None):
     numbers = collect.metrics(client.frames.snapshot(outcome["mark"]),
                               approver.decisions, approver.questions,
                               effects["rows"])
+    numbers["llm"] = collect.llm_usage(os.path.join(out, "llm_usage.jsonl"))
 
     _write(out, "result.json", {
         "task_id": spec.get("id"),

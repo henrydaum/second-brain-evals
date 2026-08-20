@@ -18,6 +18,7 @@ the agent was subject to would let a policy bug hide the evidence of itself.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import time
 
@@ -215,4 +216,38 @@ def metrics(frames, decisions, questions, ledger_rows):
         "notifications": sum(1 for f in frames
                              if f.get("kind") == "notification"),
         "errors": sum(1 for f in frames if f.get("kind") == "error"),
+    }
+
+
+def llm_usage(path):
+    """Summarize benchmark telemetry emitted by the kernel's LLM event bus.
+
+    Second Brain currently exposes provider-reported prompt tokens but not
+    completion tokens on this event.  Unknown token counts remain explicit;
+    they are never treated as zero.
+    """
+    rows = []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(row, dict):
+                    rows.append(row)
+    except OSError:
+        pass
+
+    known = [int(row["prompt_tokens"]) for row in rows
+             if isinstance(row.get("prompt_tokens"), (int, float))]
+    durations = [float(row["duration_s"]) for row in rows
+                 if isinstance(row.get("duration_s"), (int, float))]
+    return {
+        "calls": len(rows),
+        "successful_calls": sum(1 for row in rows if row.get("ok") is True),
+        "failed_calls": sum(1 for row in rows if row.get("ok") is False),
+        "calls_with_prompt_tokens": len(known),
+        "prompt_tokens_total_known": sum(known) if known else None,
+        "duration_s_total": round(sum(durations), 3),
     }
