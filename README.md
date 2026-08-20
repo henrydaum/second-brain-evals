@@ -142,6 +142,37 @@ python compare_harness_runs.py minimax-yolo minimax-lockdown `
 See [docs/HARNESS_BENCH.md](docs/HARNESS_BENCH.md) for architecture, artifacts,
 scoring caveats, and troubleshooting.
 
+## The console
+
+One page for the whole loop:
+
+```powershell
+python bench_console.py
+```
+
+Opens `http://127.0.0.1:8765` with three tabs:
+
+- **Jobs** — a form to configure a job (model, plugin profile, permission
+  mode, repeats, task selection) and a list of the ones already planned.
+  *Preview selection* resolves the task list before committing to anything;
+  planning spends nothing. Unfinished jobs get a **resume** button.
+- **Live** — the existing viewer, scoped to the replicate in flight, with a
+  job-level status line. It returns to Jobs a few seconds after the job ends.
+- **Data** — the exported database, with saved queries for `config_scores`,
+  `task_reliability`, per-profile cost, failed checks and transcripts, plus a
+  free SQL box. Read-only: the file is opened `mode=ro`.
+
+The dataset is re-exported automatically when a job finishes, so Data is
+current the moment you land back on it.
+
+**One job at a time.** Each task starts a container and spends quota, so a
+second concurrent job would contend for both and make the timings meaningless.
+The runner refuses rather than queues — a queued job waits invisibly, and the
+point of the page is seeing what is happening now.
+
+Binds to 127.0.0.1 only. Everything it does is also available from the CLI
+below.
+
 ## Jobs: configuration in, data out
 
 A **job** is a configuration — model, plugin profile, permission mode, task
