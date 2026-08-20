@@ -649,3 +649,106 @@ def test_load_state_carries_pricing_for_the_run_model(tmp_path: Path) -> None:
     state = viewer.load_state(run, "a", 0)
     assert state["pricing"]["model"] == "minimax/MiniMax-M3"
     assert state["pricing"]["cached_input_usd_per_mtok"] == 0.06
+
+
+# -- stale images -----------------------------------------------------
+
+def _template(tmp_path: Path, monkeypatch, **manifest) -> None:
+    import run_harness_bench as launcher
+    monkeypatch.setattr(launcher, "ROOT", tmp_path)
+    (tmp_path / "template").mkdir(exist_ok=True)
+    (tmp_path / "template" / "template_manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(launcher, "kernel_repo", lambda: tmp_path / "no-repo")
+
+
+def test_a_profile_the_image_cannot_apply_is_fatal(tmp_path: Path, monkeypatch) -> None:
+    """The one failure mode that produces confident, mislabelled data.
+
+    An image built before runtime profiles ignores SB_REMOVE_PACKAGES
+    silently. The run then records profile="no-script" while the agent had
+    run_script the whole time -- and every downstream comparison inherits the
+    wrong label with nothing anywhere reporting a problem.
+    """
+    from run_harness_bench import image_freshness
+
+    _template(tmp_path, monkeypatch, kernel_commit="a" * 40, store_commit="b" * 40)
+    verdict = image_freshness("no-script")
+    assert verdict["fatal"] and "no-script" in verdict["fatal"][0]
+
+    # The default profile asks for no delta, so the same image is fine for it.
+    assert image_freshness("bench")["fatal"] == []
+
+
+def test_a_moved_kernel_warns_but_does_not_block(tmp_path: Path, monkeypatch) -> None:
+    """Missing telemetry is honest, just less useful; a wrong label is not.
+
+    A run against an older kernel records that kernel's commit and reports the
+    counts it actually had, so the data is correct -- merely thinner. That is
+    a warning, not a refusal, because benchmarking an older build on purpose
+    is a legitimate thing to do.
+    """
+    import run_harness_bench as launcher
+    from run_harness_bench import image_freshness
+
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    _template(tmp_path, monkeypatch, tool_names=["read_file"],
+              kernel_commit="a" * 40, store_commit="b" * 40)
+    monkeypatch.setattr(launcher, "kernel_repo", lambda: repo)
+    monkeypatch.setattr(launcher, "git", lambda root, *args: "c" * 40)
+
+    verdict = image_freshness("bench")
+    assert verdict["fatal"] == []
+    assert any("kernel moved" in line for line in verdict["warn"])
+    assert any("store moved" in line for line in verdict["warn"])
+
+
+def test_a_current_image_reports_nothing(tmp_path: Path, monkeypatch) -> None:
+    import run_harness_bench as launcher
+    from run_harness_bench import image_freshness
+
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    _template(tmp_path, monkeypatch, tool_names=["read_file", "run_script"],
+              kernel_commit="a" * 40, store_commit="a" * 40)
+    monkeypatch.setattr(launcher, "kernel_repo", lambda: repo)
+    monkeypatch.setattr(launcher, "git", lambda root, *args: "a" * 40)
+
+    verdict = image_freshness("no-script")
+    assert verdict == {"fatal": [], "warn": []}
+
+
+def test_a_missing_profile_record_is_not_agreement(tmp_path: Path) -> None:
+    """Absence of evidence was being read as evidence of absence.
+
+    The mismatch check only fired when live/profile.json existed and
+    disagreed. An image that ignores profiles writes no record at all, so
+    there was nothing to disagree with and a mislabelled run passed clean.
+    """
+    run = _trial_run(tmp_path / "runs", "job-r1", "001-file", 1.0,
+                     [{"prompt_tokens": 10, "ok": True}])
+    status = run / "tasks" / "001-file" / "status.json"
+    payload = json.loads(status.read_text(encoding="utf-8"))
+    payload["profile"] = "no-script"
+    status.write_text(json.dumps(payload), encoding="utf-8")
+
+    output = tmp_path / "db"
+    export_runs([run], output)
+    connection = sqlite3.connect(output / "harness_bench.sqlite")
+    try:
+        flags = connection.execute("SELECT validity_flags FROM trials").fetchone()[0]
+    finally:
+        connection.close()
+    assert "profile_unverified" in flags
+
+    # The default profile needs no record, so it must not be flagged.
+    payload["profile"] = "bench"
+    status.write_text(json.dumps(payload), encoding="utf-8")
+    export_runs([run], output, rebuild=True)
+    connection = sqlite3.connect(output / "harness_bench.sqlite")
+    try:
+        assert "profile_unverified" not in (
+            connection.execute("SELECT validity_flags FROM trials").fetchone()[0] or "")
+    finally:
+        connection.close()

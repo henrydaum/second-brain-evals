@@ -510,6 +510,13 @@ def collect_trial(run_dir: Path, run: dict[str, Any], task_id: str,
     asked = status.get("profile") or run.get("profile")
     if effective and asked and effective.get("profile") != asked:
         flags.append("profile_mismatch")
+    elif asked and asked != "bench" and not effective:
+        # **Absence is not agreement.** An image built before runtime profiles
+        # ignores the delta silently and writes no profile record, so a run
+        # labelled ``no-script`` can be a plain ``bench`` run with a wrong
+        # label. Checking only for disagreement let exactly that pass: there
+        # was nothing to disagree with.
+        flags.append("profile_unverified")
     requested_mode = status.get("mode") or run.get("mode")
     if granted_mode and requested_mode == "yolo" and granted_mode != "yolo":
         flags.append("mode_not_granted")

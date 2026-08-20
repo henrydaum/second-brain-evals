@@ -39,7 +39,7 @@ from typing import Any
 import view_harness_bench
 from export_harness_bench_data import DATABASE_NAME, RESULTS, read_json
 from harness_bench_api import HarnessBenchAPI, JobSpec, MODES
-from run_harness_bench import MODELS, PROFILES
+from run_harness_bench import MODELS, PROFILES, image_freshness
 
 ROOT = Path(__file__).resolve().parent
 
@@ -193,6 +193,7 @@ def page(title: str, active: str, body: str, script: str = "") -> bytes:
 
 
 DASHBOARD_BODY = """
+<div id="banner"></div>
 <div class="card">
  <h2>New job</h2>
  <div class="grid">
@@ -272,7 +273,21 @@ async function load(){
   catalog = await (await fetch('/api/catalog')).json();
   $('model').innerHTML = catalog.models.map(m => `<option>${esc(m)}</option>`).join('');
   $('profile').innerHTML = catalog.profiles.map(p =>
-    `<option value="${esc(p.name)}">${esc(p.name)} — ${esc(p.description)}</option>`).join('');
+    `<option value="${esc(p.name)}"${p.blocked ? ' disabled' : ''}>${esc(p.name)}` +
+    `${p.blocked ? ' (needs image rebuild)' : ''} — ${esc(p.description)}</option>`).join('');
+  // A stale image is the one failure that produces confidently mislabelled
+  // data rather than an error, so it gets said out loud before anything runs.
+  const blocked = catalog.profiles.filter(p => p.blocked);
+  const notes = [...(catalog.warnings || []), ...blocked.flatMap(p => p.problems)];
+  $('banner').innerHTML = notes.length
+    ? `<div class="card" style="border-color:var(--amber)">
+         <h2 class="amber">Image is out of date</h2>
+         <ul style="margin:0;padding-left:18px">${notes.map(n => `<li>${esc(n)}</li>`).join('')}</ul>
+         <p class="muted">Rebuild:
+           <code>python build_template.py --profile bench</code> then
+           <code>python run_harness_bench.py --build-image</code></p>
+       </div>`
+    : '';
   $('mode').innerHTML = catalog.modes.map(m => `<option>${esc(m)}</option>`).join('');
   chips('difficulty', catalog.difficulties, 'difficulty');
   chips('class', catalog.classes, 'class');
@@ -508,14 +523,20 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
     def _catalog(self) -> dict[str, Any]:
         rows = self.api.list_tasks()
+        # Per profile, because staleness is not a property of the image alone:
+        # the same image is fine for `bench` and fatal for `no-script`.
+        freshness = {name: image_freshness(name) for name in PROFILES}
         return {
             "models": sorted(MODELS),
-            "profiles": [{"name": name, "description": spec.get("description") or ""}
+            "profiles": [{"name": name, "description": spec.get("description") or "",
+                          "blocked": bool(freshness[name]["fatal"]),
+                          "problems": freshness[name]["fatal"]}
                          for name, spec in sorted(PROFILES.items())],
             "modes": list(MODES),
             "difficulties": sorted({row["difficulty"] for row in rows}),
             "classes": sorted({row["class"] for row in rows}),
             "task_count": len(rows),
+            "warnings": freshness["bench"]["warn"],
         }
 
     def _resolve(self, selector: dict[str, Any]) -> dict[str, Any]:

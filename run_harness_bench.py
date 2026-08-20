@@ -104,6 +104,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--self-test", action="store_true", help="run official demo oracle and mode reuse without a model call")
     parser.add_argument("--execute", action="store_true", help="authorize provider-backed task execution")
     parser.add_argument("--skip-provider-check", action="store_true")
+    parser.add_argument("--allow-stale-image", action="store_true",
+                        help="run even though the image predates the requested profile")
     parser.add_argument("--run-id")
     parser.add_argument("--resume", metavar="RUN_DIR")
     parser.add_argument("--retry-failed", action="store_true")
@@ -130,6 +132,22 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
     tasks = choose_tasks(options, metadata["tasks"])
+
+    # Checked before the task list is even priced: a stale image is cheapest
+    # to notice now, and most expensive to notice after a full suite has run
+    # under a label that was never true.
+    freshness = image_freshness(options.profile)
+    for line in freshness["warn"]:
+        print(f"warning: {line}", file=sys.stderr)
+    if freshness["fatal"] and not options.allow_stale_image:
+        for line in freshness["fatal"]:
+            print(f"error: {line}", file=sys.stderr)
+        print("\nRebuild with:\n"
+              "  python build_template.py --profile bench\n"
+              "  python run_harness_bench.py --build-image\n"
+              "or pass --allow-stale-image to run anyway.", file=sys.stderr)
+        return 2
+
     if not options.execute:
         print("No model calls made. Add --execute to run: " + ", ".join(tasks))
         return 0
@@ -344,6 +362,69 @@ def choose_tasks(options: argparse.Namespace, available: dict[str, Any]) -> list
     if not resolved:
         raise RuntimeError("task selection resolved to nothing")
     return resolved
+
+
+def kernel_repo() -> Path:
+    """The Second Brain checkout the image is supposed to be built from."""
+    configured = os.environ.get("SECOND_BRAIN_REPO")
+    if configured:
+        return Path(configured)
+    return ROOT.parent / "Second Brain"
+
+
+def image_freshness(profile: str) -> dict[str, list[str]]:
+    """Compare what the image was built from with what is on disk now.
+
+    **A stale image fails silently and expensively, which is why this exists.**
+    The image carries its own kernel, its own copy of the store packages, and
+    its own ``entrypoint.py``. Editing any of those in the checkout changes
+    nothing until the image is rebuilt, and every symptom of forgetting looks
+    like a different bug:
+
+    * a kernel without the widened telemetry reports no output tokens, so cost
+      silently halves;
+    * an ``entrypoint.py`` without profile support ignores
+      ``SB_REMOVE_PACKAGES`` entirely, so a run *labelled* ``no-script`` runs
+      with ``run_script`` and the label is simply wrong;
+    * a template built before ``tool_names`` leaves ``visible_tools`` null.
+
+    Returns ``{"fatal": [...], "warn": [...]}``. A wrong label is fatal
+    because the resulting data is not merely incomplete, it is mislabelled,
+    and nothing downstream can tell. Missing telemetry is a warning: the run
+    is honest about what it recorded, just less useful.
+    """
+    manifest = read_json(ROOT / "template" / "template_manifest.json") or {}
+    fatal: list[str] = []
+    warn: list[str] = []
+
+    # The image predates runtime profiles if its template was built before the
+    # builder started recording installed files. Requesting a non-default
+    # profile against it produces a run whose profile column is a lie.
+    supports_profiles = "tool_names" in manifest
+    wants_delta = bool((PROFILES.get(profile) or {}).get("add")
+                       or (PROFILES.get(profile) or {}).get("remove"))
+    if wants_delta and not supports_profiles:
+        fatal.append(
+            f"--profile {profile} needs an image built after runtime profiles "
+            "existed, but template/template_manifest.json records no "
+            "'tool_names'. The container would ignore the profile and run the "
+            "seed's plugins while the results claimed otherwise.")
+    elif not supports_profiles:
+        warn.append("template predates 'tool_names'; visible_tools will be null.")
+
+    repo = kernel_repo()
+    if (repo / ".git").exists():
+        for label, ref, built in (("kernel", "HEAD", manifest.get("kernel_commit")),
+                                  ("store", "origin/store", manifest.get("store_commit"))):
+            try:
+                current = git(repo, "rev-parse", ref)
+            except Exception:                                # noqa: BLE001
+                continue
+            if built and current and built != current:
+                warn.append(
+                    f"{label} moved since the image was built: image has "
+                    f"{built[:12]}, checkout has {current[:12]}.")
+    return {"fatal": fatal, "warn": warn}
 
 
 def build_image(image: str) -> None:
