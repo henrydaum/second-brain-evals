@@ -64,9 +64,17 @@ def main(argv: list[str] | None = None) -> int:
     out.mkdir(parents=True, exist_ok=True)
 
     requested_mode = "ask" if args.security_mode == "mediated" else args.security_mode
+    task_prompt = prompt_file.read_text(encoding="utf-8")
+    workspace_instruction = (
+        f"Benchmark workspace: `{workspace}`. Treat this directory as the task's "
+        "working directory, not `/app`. For tools that accept a path, resolve "
+        "relative task paths under this workspace. For `run_command`, set its "
+        f"`cwd` argument to `{workspace}` on the first call; that directory then "
+        "persists for later shell calls. Do not search `/app` for task inputs.\n\n"
+    )
     spec = {
         "id": args.task_id,
-        "prompt": prompt_file.read_text(encoding="utf-8"),
+        "prompt": workspace_instruction + task_prompt,
         "workdir": str(workspace),
         "thread": "main",
         "fresh_session": round_number == 1,
