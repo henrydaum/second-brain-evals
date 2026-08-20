@@ -48,6 +48,7 @@ Validation and self-tests make no model calls:
 ```powershell
 python run_harness_bench.py --validate
 python run_harness_bench.py --self-test
+python audit_harness_bench.py --output results\harness-bench\corpus-audit.json
 ```
 
 Paid execution always requires the explicit `--execute` switch. Begin with one
@@ -96,6 +97,11 @@ sandbox, and logs remain in `results/harness-bench/<run-id>/tasks/<task-id>/`.
 - `lockdown` denies tool operations at the kernel security boundary.
 - `mediated` uses an explicit benchmark policy that permits workspace file work
   and Second Brain's scripting tool while retaining mediation elsewhere.
+
+The benchmark keeps the Essentials bundle except for the interactive-only
+Telegram frontend, `ask_question`, and `show_files`. All other Essentials tools
+remain available. The exact profile and store commit are recorded in the
+template manifest and each run.
 
 Use identical task selections, model configuration, timeouts, and benchmark
 revision when comparing modes or frameworks. MiniMax M3 is useful for cheap

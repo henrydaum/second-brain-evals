@@ -80,7 +80,7 @@ def configure() -> None:
 def main() -> None:
     configure()
     sys.path.insert(0, "/opt/sb-evals")
-    from eval_telemetry import install
+    from harness.eval_telemetry import install
 
     install()
     os.chdir("/app")

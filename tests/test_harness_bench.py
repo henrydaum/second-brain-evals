@@ -3,8 +3,11 @@ from pathlib import Path
 
 from driver.wire import Frames
 from compare_harness_runs import compare_runs
+from audit_harness_bench import audit
 from evals.harness_bench.drive_round import _manifest, _round_number
 from run_harness_bench import (
+    BENCHMARK_TOOLS,
+    CONTAINER_WORK_ROOT,
     DEFAULT_BENCHMARK,
     ProviderUnavailableError,
     SELECTIONS,
@@ -14,6 +17,12 @@ from run_harness_bench import (
     summarize,
     validate_benchmark,
 )
+
+
+def test_benchmark_profile_only_removes_interactive_tools() -> None:
+    assert "ask_question" not in BENCHMARK_TOOLS
+    assert "show_files" not in BENCHMARK_TOOLS
+    assert {"run_command", "run_script", "web_search", "spawn_subagent"} <= BENCHMARK_TOOLS
 from view_harness_bench import HTML, load_state
 
 
@@ -30,6 +39,17 @@ def test_pinned_release_has_all_tasks_and_pilot_covers_categories() -> None:
     assert difficulties.count("medium") == 2
     assert difficulties.count("hard") == 1
     assert metadata["tasks"][SELECTIONS["smoke"][1]]["rounds"] == 2
+
+
+def test_corpus_audit_proves_this_is_not_a_large_knowledgebase_benchmark() -> None:
+    report = audit(DEFAULT_BENCHMARK)
+
+    assert report["tasks"] == 106
+    assert report["fixture_files"] == 508
+    assert report["fixture_bytes"] == 388123
+    assert report["largest_non_media_task"]["non_media_bytes"] < 13_000
+    assert report["tasks_with_hooks"] == 28
+    assert len(report["local_http_tasks"]) == 7
 
 
 def test_fetch_is_idempotent_for_pinned_checkout() -> None:
@@ -58,7 +78,12 @@ def test_stage_uses_generic_cli_and_requested_mode(tmp_path: Path) -> None:
     model = config["models"]["second-brain"]
     assert model["adapter"] == "generic_cli"
     assert model["model"] == "minimax/MiniMax-M3"
-    assert model["args"][-1] == "lockdown"
+    assert model["args"][model["args"].index("--security-mode") + 1] == "lockdown"
+    assert model["args"][-2] == "--wall-seconds"
+    assert float(model["args"][-1]) == 570.0
+    app = json.loads((stage / "config" / "app.json").read_text(encoding="utf-8"))
+    assert app["work_root"] == CONTAINER_WORK_ROOT
+    assert app["work_root"].startswith("/data/Second Brain/workspace/")
     assert (stage / "tasks" / "033-offline-knowledge-qa" / "oracle_grade.py").is_file()
 
 

@@ -11,6 +11,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import posixpath
 import re
 import shutil
 import statistics
@@ -26,6 +27,7 @@ from typing import Any
 import yaml
 
 
+
 ROOT = Path(__file__).resolve().parent
 EVAL_DIR = ROOT / "evals" / "harness_bench"
 LOCK = json.loads((EVAL_DIR / "benchmark.lock.json").read_text(encoding="utf-8"))
@@ -33,6 +35,15 @@ SELECTIONS = json.loads((EVAL_DIR / "pilot.json").read_text(encoding="utf-8"))
 DEFAULT_BENCHMARK = ROOT / "build" / "harness-bench-src"
 DEFAULT_IMAGE = "second-brain:harness-bench"
 RESULTS = ROOT / "results" / "harness-bench"
+BENCHMARK_TOOLS = {
+    "edit_file", "glob", "grep", "read_file", "run_command", "run_script",
+    "schedule_subagent", "spawn_subagent", "sql_query", "validate", "web_search",
+}
+CONTAINER_BENCH_ROOT = "/work/harnessbench"
+# run_command deliberately accepts cwd only under Second Brain's application
+# or data roots. Keeping official task sandboxes in the agent data workspace
+# makes the real workspace reachable without weakening that production rule.
+CONTAINER_WORK_ROOT = "/data/Second Brain/workspace/harnessbench-sandboxes"
 PROVIDER_PATTERNS = (
     "usage limit reached",
     "quota exceeded",
@@ -113,7 +124,7 @@ def main(argv: list[str] | None = None) -> int:
 
     image_id = inspect_image(options.image)
     run_dir, run = open_run(options, tasks, model, metadata, image_id)
-    print(f"Harness-Bench run {run['run_id']}: {len(tasks)} tasks, {options.mode}, {model}")
+    print(f"Harness-Bench run {run['run_id']}: {len(tasks)} tasks, {options.mode}, Essentials tools, {model}")
     print(f"Results: {run_dir}")
     write_json(run_dir / "run.json", run)
 
@@ -230,12 +241,14 @@ def self_test(benchmark: Path, image: str) -> None:
             temp_root = Path(temp)
             stage = temp_root / "harnessbench"
             stage_benchmark(benchmark, stage, "001-file", "yolo", "openai/fake")
-            write_json(stage / "config" / "harness.json", {"models": {"demo": {"adapter": "demo"}}})
+            harness_config = read_json(stage / "config" / "harness.json")
+            harness_config["models"]["demo"] = {"adapter": "demo"}
+            write_json(stage / "config" / "harness.json", harness_config)
             env_file = temp_root / "self-test.env"
             env_file.write_text(
                 "SB_LLM_API_KEY=fake\n"
                 "SB_LLM_MODEL=openai/fake\n"
-                "SB_LLM_ENDPOINT=http://127.0.0.1:9/v1\n"
+                "SB_LLM_ENDPOINT=http://127.0.0.1:9999/v1\n"
                 "SB_HTTP_TOKEN=probe-token\n",
                 encoding="utf-8",
             )
@@ -247,6 +260,13 @@ def self_test(benchmark: Path, image: str) -> None:
             mode_probe = docker("exec", name, "python", "/work/probe_harness_modes.py")
             if mode_probe.returncode:
                 raise RuntimeError("mode/session probe failed:\n" + mode_probe.stdout + mode_probe.stderr)
+            fake_copy = docker("cp", str(ROOT / "probes" / "fake_openai_server.py"), f"{name}:/work/fake_openai_server.py")
+            if fake_copy.returncode:
+                raise RuntimeError(fake_copy.stderr or "could not copy fake provider")
+            fake_start = docker("exec", "-d", name, "python", "/work/fake_openai_server.py")
+            if fake_start.returncode:
+                raise RuntimeError(fake_start.stderr or "could not start fake provider")
+            time.sleep(0.25)
             command = (
                 "PYTHONPATH=/work/harnessbench/src "
                 "HARNESSBENCH_APP_CONFIG=/work/harnessbench/config/app.json "
@@ -266,7 +286,53 @@ def self_test(benchmark: Path, image: str) -> None:
             score = (payload.get("oracle_result") or {}).get("outcome_score")
             if score != 1.0:
                 raise RuntimeError(f"official demo oracle returned {score!r}, expected 1.0")
-            print("Self-test passed: 106-task release pin, generalized image boot, mode reuse, official runner, and oracle score 1.0; model calls=0.")
+            agent_command = command.replace("--harness demo --mode demo", "--harness second-brain --mode live")
+            agent = docker("exec", name, "sh", "-c", agent_command)
+            if agent.returncode:
+                raise RuntimeError("Second Brain fake-provider task failed:\n" + agent.stdout + agent.stderr)
+            found = docker("exec", name, "sh", "-c", "find /work/harnessbench/results -name 001-file.json -path '*second-brain*' -print -quit")
+            if not found.stdout.strip():
+                raise RuntimeError("Second Brain official result was not written")
+            agent_payload = json.loads(docker("exec", name, "cat", found.stdout.strip()).stdout)
+            agent_score = (agent_payload.get("oracle_result") or {}).get("outcome_score")
+            provider_log = docker("exec", name, "cat", "/work/fake-provider.jsonl", check=False).stdout
+            if agent_score != 1.0:
+                agent_workspace = str((agent_payload.get("oracle_result") or {}).get("workspace") or "")
+                sandbox_root = posixpath.dirname(agent_workspace) if agent_workspace else ""
+                driver_result = docker(
+                    "exec", name, "cat", f"{sandbox_root}/second-brain/round-01/result.json",
+                    check=False,
+                ).stdout if sandbox_root else ""
+                app_log = docker(
+                    "exec", name, "sh", "-c", "tail -n 160 '/data/Second Brain/app.log'",
+                    check=False,
+                ).stdout
+                sandbox_files = docker(
+                    "exec", name, "find", sandbox_root, "-maxdepth", "5", "-type", "f", "-print",
+                    check=False,
+                ).stdout if sandbox_root else ""
+                diagnostic = json.dumps({
+                    "oracle_result": agent_payload.get("oracle_result"),
+                    "adapter_result": agent_payload.get("adapter_result"),
+                    "driver_result": read_json_text(driver_result),
+                    "fake_provider_log": provider_log,
+                    "sandbox_files": sandbox_files,
+                    "app_log_tail": app_log,
+                }, indent=2, ensure_ascii=False, default=str)
+                raise RuntimeError(
+                    f"Second Brain fake-provider oracle returned {agent_score!r}, expected 1.0:\n{diagnostic[-12000:]}"
+                )
+            calls = docker("exec", name, "sh", "-c", "wc -l < /work/fake-provider.jsonl")
+            if int(calls.stdout.strip() or 0) < 2:
+                raise RuntimeError("fake provider did not observe the expected tool loop")
+            provider_rows = [json.loads(line) for line in provider_log.splitlines() if line.strip()]
+            observed_tools = set(provider_rows[0].get("tools") or []) if provider_rows else set()
+            if observed_tools != BENCHMARK_TOOLS:
+                raise RuntimeError(
+                    "Essentials-minus-interactive tool profile was not enforced: "
+                    f"expected={sorted(BENCHMARK_TOOLS)!r} observed={sorted(observed_tools)!r}"
+                )
+            print("Self-test passed: pinned release, generalized image boot, mode reuse, official runner, actual Second Brain tool loop, live workspace, and oracle score 1.0; external model calls=0.")
     finally:
         docker("rm", "-f", name, check=False)
 
@@ -277,7 +343,8 @@ def open_run(options, tasks, model, metadata, image_id):
         run = read_json(run_dir / "run.json")
         if not run:
             raise RuntimeError(f"resume metadata is missing: {run_dir / 'run.json'}")
-        expected = {"mode": options.mode, "model": model, "benchmark_commit": metadata["commit"], "image_id": image_id}
+        expected = {"mode": options.mode, "model": model,
+                    "benchmark_commit": metadata["commit"], "image_id": image_id}
         conflicts = {key: (run.get(key), value) for key, value in expected.items() if run.get(key) != value}
         if conflicts:
             raise RuntimeError("refusing to mix configurations while resuming: " + repr(conflicts))
@@ -298,6 +365,8 @@ def open_run(options, tasks, model, metadata, image_id):
         "created_at": time.time(),
         "mode": options.mode,
         "model": model,
+        "tool_profile": "bundle_essentials minus telegram, ask_question, show_files",
+        "visible_tools": sorted(BENCHMARK_TOOLS),
         "tasks": tasks,
         "task_metadata": {task_id: metadata["tasks"][task_id] for task_id in tasks},
         "benchmark_repository": metadata["repository"],
@@ -395,10 +464,10 @@ def stage_benchmark(source: Path, dest: Path, task_id: str, mode: str, model: st
     config = dest / "config"
     config.mkdir(parents=True)
     write_json(config / "app.json", {
-        "data_dir": "/work/harnessbench/data",
-        "tasks_dir": "/work/harnessbench/tasks",
-        "results_dir": "/work/harnessbench/results",
-        "work_root": "/work/harnessbench/sandboxes",
+        "data_dir": f"{CONTAINER_BENCH_ROOT}/data",
+        "tasks_dir": f"{CONTAINER_BENCH_ROOT}/tasks",
+        "results_dir": f"{CONTAINER_BENCH_ROOT}/results",
+        "work_root": CONTAINER_WORK_ROOT,
         "default_timeout_sec": 3600,
         "default_rounds": 1,
     })
@@ -414,8 +483,14 @@ def stage_benchmark(source: Path, dest: Path, task_id: str, mode: str, model: st
             "--sandbox", "{sandbox}",
             "--task-id", "{task_id}",
             "--security-mode", mode,
+            "--wall-seconds", str(max(30, task_timeout(source, task_id) - 30)),
         ],
     }}})
+
+
+def task_timeout(source: Path, task_id: str) -> int:
+    manifest = yaml.safe_load((source / "tasks" / task_id / "task.yaml").read_text(encoding="utf-8")) or {}
+    return int(manifest.get("timeout_sec") or 600)
 
 
 def run_container(name: str, image: str, env_file: Path) -> None:
@@ -483,7 +558,7 @@ def collect_container(container: str, task_dir: Path) -> None:
         return
     for remote, local in (
         ("/work/harnessbench/results", task_dir / "official-results"),
-        ("/work/harnessbench/sandboxes", task_dir / "sandboxes"),
+        (CONTAINER_WORK_ROOT, task_dir / "sandboxes"),
         ("/work/live", task_dir / "live"),
     ):
         local.parent.mkdir(parents=True, exist_ok=True)
@@ -681,6 +756,13 @@ def read_json(path: Path) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+
+
+def read_json_text(value: str) -> Any:
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return value
 
 
 def write_json(path: Path, payload: Any) -> None:

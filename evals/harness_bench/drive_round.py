@@ -53,6 +53,7 @@ def main(argv: list[str] | None = None) -> int:
         choices=("yolo", "lockdown", "mediated"),
         required=True,
     )
+    parser.add_argument("--wall-seconds", type=float, default=870.0)
     args = parser.parse_args(argv)
 
     workspace = Path(args.workspace).resolve()
@@ -73,7 +74,7 @@ def main(argv: list[str] | None = None) -> int:
         "manifest": _manifest(args.security_mode, workspace),
         "ui": {"policy": "canned", "text": "Proceed using the supplied task materials."},
         "budget": {
-            "wall_s": float(os.environ.get("SB_TASK_TIMEOUT", "900")),
+            "wall_s": float(os.environ.get("SB_TASK_TIMEOUT") or args.wall_seconds),
             "stall_s": float(os.environ.get("SB_STALL_TIMEOUT", "300")),
         },
     }

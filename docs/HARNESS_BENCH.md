@@ -20,6 +20,17 @@ For every scheduled task the launcher:
 The container is then removed. No task receives another task's conversation or
 workspace state.
 
+Official sandboxes live under Second Brain's ephemeral data workspace. This is
+not cosmetic: `run_command` confines its working directory to the application
+and data roots. Keeping tasks under `/work` allowed absolute file tools but
+silently prevented shell-based builds, tests, Git, SQLite, archives, and local
+HTTP work. The data tree is fresh per task and collected before removal.
+
+The `bundle_essentials` catalogue is exposed except for three interactive-only
+components that cannot help an unattended run: Telegram, `ask_question`, and
+`show_files`. The installed bundle, explicit exclusions, visible tool names,
+and store commit are recorded.
+
 ## Pilot selection
 
 `evals/harness_bench/pilot.json` defines a two-task smoke set and an eight-task

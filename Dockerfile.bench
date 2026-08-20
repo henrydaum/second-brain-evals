@@ -17,7 +17,7 @@ RUN PIP_USER=0 pip install --no-cache-dir --no-user \
 COPY --chown=1000:1000 ["template/Second Brain/", "/seed/"]
 COPY --chown=1000:1000 template/template_manifest.json /seed/template_manifest.json
 COPY --chown=1000:1000 driver/ /opt/sb-driver/driver/
-COPY --chown=1000:1000 harness/eval_telemetry.py /opt/sb-evals/eval_telemetry.py
+COPY --chown=1000:1000 harness/ /opt/sb-evals/harness/
 COPY --chown=1000:1000 entrypoint.py /opt/sb-evals/entrypoint.py
 COPY --chown=1000:1000 evals/harness_bench/drive_round.py /opt/sb-evals/drive_round.py
 

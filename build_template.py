@@ -35,6 +35,12 @@ BASE_IMAGE = "second-brain:latest"
 PROFILES = {
     "bench": {
         "packages": ["bundle_essentials", "frontend_http"],
+        # Interactive surfaces have no user on the other side during an eval.
+        # Install the published bundle first, then remove only these members so
+        # the benchmark remains "Essentials minus interactive-only pieces".
+        "exclude_packages": [
+            "frontend_telegram", "tool_ask_question", "tool_show_files",
+        ],
         # A service is not loaded because it is installed. These are the
         # *registered* names (a class's ``name``), not file stems.
         "autoload_services": ["web_search_provider"],
@@ -43,6 +49,7 @@ PROFILES = {
         "packages": ["llm_litellm", "frontend_http", "tool_read_file",
                      "tool_edit_file", "tool_run_command", "tool_run_script"],
         "autoload_services": [],
+        "exclude_packages": [],
     },
 }
 
@@ -56,6 +63,7 @@ from config import config_manager
 
 packages = json.loads(sys.argv[1])
 services = json.loads(sys.argv[2])
+exclusions = json.loads(sys.argv[3])
 installed = []
 for stem in packages:
     result = pm.install_package("/app", stem)
@@ -64,6 +72,13 @@ for stem in packages:
         raise SystemExit(1)
     installed.append(stem)
     print("installed:", stem, flush=True)
+
+for stem in exclusions:
+    result = pm.uninstall_package(stem)
+    if not result.ok:
+        print("FAILED TO EXCLUDE:", stem, getattr(result, "lines", ""), flush=True)
+        raise SystemExit(1)
+    print("excluded:", stem, flush=True)
 
 config = config_manager.load()
 config["enabled_frontends"] = ["http"]
@@ -75,7 +90,8 @@ commit = subprocess.run(["git", "-C", "/app", "rev-parse", "origin/store"],
                         capture_output=True, text=True).stdout.strip()
 head = subprocess.run(["git", "-C", "/app", "rev-parse", "HEAD"],
                       capture_output=True, text=True).stdout.strip()
-manifest = {"packages": installed, "autoload_services": services,
+manifest = {"packages": installed, "excluded_packages": exclusions,
+            "autoload_services": services,
             "store_commit": commit, "kernel_commit": head,
             "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 open("/data/template_manifest.json", "w").write(json.dumps(manifest, indent=2))
@@ -131,7 +147,8 @@ def main() -> int:
         "-e", "PYTHONUSERBASE=/tmp/sb-python",
         "-v", f"{staging}:/data",
         options.image, "python", "-c", INSIDE,
-        json.dumps(spec["packages"]), json.dumps(spec["autoload_services"]))
+        json.dumps(spec["packages"]), json.dumps(spec["autoload_services"]),
+        json.dumps(spec["exclude_packages"]))
     if result.returncode != 0:
         print("template build failed", file=sys.stderr)
         return result.returncode
