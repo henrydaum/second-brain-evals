@@ -589,3 +589,63 @@ def test_a_single_run_export_never_prunes_the_rest(tmp_path: Path) -> None:
         assert connection.execute("SELECT COUNT(*) FROM trials").fetchone()[0] == 2
     finally:
         connection.close()
+
+
+# -- prices reaching the viewer ---------------------------------------
+
+def test_the_viewer_is_served_prices_rather_than_carrying_its_own() -> None:
+    """A rate duplicated in the page is a rate that drifts from the invoice.
+
+    The viewer's number is the one somebody reads while deciding whether to
+    let an expensive run continue, so it has to come from the same file the
+    exporter bills by.
+    """
+    import view_harness_bench as viewer
+
+    rates = viewer._pricing("minimax/MiniMax-M3")
+    assert rates["input_usd_per_mtok"] == 0.30
+    assert rates["cached_input_usd_per_mtok"] == 0.06
+    assert rates["output_usd_per_mtok"] == 1.20
+    # An unknown model gets nulls, which the page shows as "no price".
+    unknown = viewer._pricing("not-a-model")
+    assert unknown["input_usd_per_mtok"] is None
+    # And no literal rate is baked into the page script.
+    assert "inputUsdPerMillion" not in viewer.HTML
+    assert "0.30" not in viewer.HTML
+
+
+def test_the_viewer_and_the_exporter_agree_on_one_worked_example() -> None:
+    """Two implementations of the same bill, in two languages.
+
+    The page computes cost in JavaScript from streamed events; the exporter
+    computes it in Python from the same events at rest. They can only be kept
+    honest by checking them against one number that is worked out by hand.
+
+    1,000,000 billed input of which 800,000 cached, 100,000 output:
+        uncached  200,000 x $0.30/M = $0.060
+        cached    800,000 x $0.06/M = $0.048
+        output    100,000 x $1.20/M = $0.120
+                                      -------
+                                      $0.228
+    """
+    prices, _ = __import__("export_harness_bench_data").pricing_table()
+    result = costs("minimax/MiniMax-M3", billed=1_000_000, cached=800_000,
+                   output=100_000, prices=prices)
+    assert result["cost_input_usd"] == 0.108
+    assert result["cost_output_usd"] == 0.12
+    assert result["cost_total_usd"] == 0.228
+
+
+def test_load_state_carries_pricing_for_the_run_model(tmp_path: Path) -> None:
+    import view_harness_bench as viewer
+
+    run = tmp_path / "run"
+    (run / "tasks" / "a").mkdir(parents=True)
+    (run / "run.json").write_text(json.dumps(
+        {"run_id": "r", "model": "minimax/MiniMax-M3", "tasks": ["a"]}), encoding="utf-8")
+    (run / "tasks" / "a" / "status.json").write_text(
+        json.dumps({"task_id": "a", "state": "running"}), encoding="utf-8")
+
+    state = viewer.load_state(run, "a", 0)
+    assert state["pricing"]["model"] == "minimax/MiniMax-M3"
+    assert state["pricing"]["cached_input_usd_per_mtok"] == 0.06

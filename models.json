@@ -17,20 +17,31 @@
     "Costs are computed at export time, so correcting a price here and",
     "re-exporting fixes every trial already on disk retroactively."
   ],
-  "pricing_version": "2026-08-20",
+  "pricing_version": "2026-08-20b",
   "models": {
     "minimax/MiniMax-M3": {
       "endpoint": "https://api.minimax.io/v1",
       "backend": "LiteLLMService",
       "context_size": 0,
       "pricing": {
-        "input_usd_per_mtok": 0.30,
-        "cached_input_usd_per_mtok": null,
-        "_output_note": "UNVERIFIED: carried over from no published source. Fill this in from MiniMax's price page before publishing any cost figure; until it is set, output cost and total cost export as NULL.",
-        "output_usd_per_mtok": null
+        "input_usd_per_mtok": 0.3,
+        "cached_input_usd_per_mtok": 0.06,
+        "output_usd_per_mtok": 1.2
       },
       "pricing_as_of": "2026-08-20",
-      "pricing_source": "TODO: url of the price page this was read from"
+      "pricing_source": "https://api.minimax.io direct-API rates (not OpenRouter's reseller rates of 0.23/0.96/0.05)",
+      "pricing_notes": [
+        "Direct MiniMax API rates, matching the endpoint in bench.env. A reseller",
+        "such as OpenRouter charges differently, so switching endpoint means",
+        "changing these numbers.",
+        "Cache WRITES are free; only cache reads are metered, which is what",
+        "cached_input_usd_per_mtok bills. cached_prompt_tokens is the share OF",
+        "input, so the exporter splits the input total rather than adding to it.",
+        "Requests over 512K input tokens bill the WHOLE request at 2x every rate.",
+        "Not modelled: the largest prompt observed on this suite is ~21K tokens,",
+        "two orders of magnitude below the threshold. Revisit if a task ever",
+        "approaches it -- trials/input_tokens_largest_call is the column to watch."
+      ]
     }
   }
 }

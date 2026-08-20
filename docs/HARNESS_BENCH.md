@@ -281,6 +281,21 @@ same block; a provider that ignores it leaves the counts `None`.
 in `models.json` and cost is computed at *export* time, so correcting a price
 and re-exporting fixes every trial already on disk.
 
+The live viewer shows input, output, cached share and running cost, and it is
+**served** those rates by `/api/state` rather than carrying its own copy — a
+price duplicated in the page is a price that drifts from the one the exporter
+bills by, and the viewer's number is the one somebody reads while deciding
+whether to let an expensive run continue.
+
+MiniMax M3 at `api.minimax.io` bills $0.30/Mtok input, **$0.06/Mtok for cache
+reads**, and $1.20/Mtok output. Cache writes are free. Note these are the
+direct-API rates: a reseller such as OpenRouter charges differently
+($0.23/$0.96/$0.05), so changing `SB_LLM_ENDPOINT` means changing
+`models.json` too. Requests above 512K input tokens bill the whole request at
+2x every rate; that tier is not modelled, because the largest prompt seen on
+this suite is ~21K tokens. `trials.input_tokens_largest_call` is the column to
+watch if that ever changes.
+
 Output and cached counts require kernel commit `f72435fe` (with store commit
 `95afb0bc`) or later. Before those, the kernel published only
 `prompt_tokens`, so trials recorded earlier carry `output_tokens = NULL` and

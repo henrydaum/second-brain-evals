@@ -88,7 +88,9 @@ section{padding:16px;min-width:0}.cards{display:flex;gap:9px;flex-wrap:wrap}.car
  <div class="card"><div class="muted">Validity</div><div id="validity" class="value">&mdash;</div></div>
  <div class="card"><div class="muted">Reliability</div><div id="reliability" class="value">1 trial</div></div>
  <div class="card"><div class="muted">Model calls</div><div id="calls" class="value">0</div></div>
- <div class="card"><div class="muted">Prompt tokens &middot; est. input cost</div><div class="value"><span id="tokens">&mdash;</span> <span id="cost" class="muted"></span></div></div>
+ <div class="card"><div class="muted">Input tokens (billed)</div><div class="value"><span id="tok-in">&mdash;</span> <span id="tok-cached" class="muted"></span></div></div>
+ <div class="card"><div class="muted">Output tokens</div><div id="tok-out" class="value">&mdash;</div></div>
+ <div class="card"><div class="muted">Cost</div><div class="value"><span id="cost">&mdash;</span> <span id="cost-detail" class="muted"></span></div></div>
  <div class="card"><div class="muted">Elapsed</div><div id="elapsed" class="value">&mdash;</div></div>
  <div class="card"><div class="muted">Tool calls</div><div id="tools" class="value">0</div></div>
  <div class="card"><div class="muted">Tool errors</div><div id="tool-errors" class="value">0</div></div>
@@ -108,8 +110,15 @@ section{padding:16px;min-width:0}.cards{display:flex;gap:9px;flex-wrap:wrap}.car
 // every poll. Replacing textContent resets scrollTop, and at 1 Hz that made
 // streaming output impossible to actually read.
 let selected=null, follow=true, cursor=0, seenTask=null;
-let calls=0, tokens=0, tokensKnown=false, toolCalls=0, toolErrors=0, repeatedActions=0, allowed=0, denied=0;
-const inputUsdPerMillion=0.30;
+// Token totals are accumulated per bucket with their own "did anyone say"
+// flags. A count the provider withheld must never read as zero: it would
+// understate the bill while the card still looked healthy.
+let calls=0, tokIn=0, tokCached=0, tokOut=0;
+let inKnown=false, cachedKnown=false, outKnown=false;
+let toolCalls=0, toolErrors=0, repeatedActions=0, allowed=0, denied=0;
+// Rates arrive from models.json via /api/state -- never hardcoded here, or
+// the number on screen drifts from the one the exporter bills by.
+let pricing=null;
 let serial=0, streamNodes=new Map(), toolNodes=new Map(), thinkingNode=null;
 let actionCounts=new Map();
 let lastEventAt=0, lastPoll=0;
@@ -120,11 +129,74 @@ function choose(id){ // an explicit click pins the task and stops following
   selected=id; follow=false; resetTask(); refresh();
 }
 function resetTask(){
-  cursor=0; calls=0; tokens=0; tokensKnown=false; toolCalls=0; toolErrors=0; repeatedActions=0; allowed=0; denied=0;
+  cursor=0; calls=0; tokIn=0; tokCached=0; tokOut=0;
+  inKnown=false; cachedKnown=false; outKnown=false;
+  toolCalls=0; toolErrors=0; repeatedActions=0; allowed=0; denied=0;
   lastEventAt=0;
   serial=0;streamNodes=new Map();toolNodes=new Map();thinkingNode=null;actionCounts=new Map();
   document.querySelector('#timeline').innerHTML='';
 }
+function renderMoney(){
+  // Tokens first.
+  document.querySelector('#tok-in').textContent = inKnown ? tokIn.toLocaleString() : '--';
+  document.querySelector('#tok-out').textContent = outKnown ? tokOut.toLocaleString() : '--';
+  const cachedEl = document.querySelector('#tok-cached');
+  if(inKnown && cachedKnown && tokIn > 0){
+    cachedEl.textContent = `(${(100*tokCached/tokIn).toFixed(0)}% cached)`;
+  }else if(inKnown){
+    // The provider said nothing about caching. Showing 0% would assert that
+    // nothing was cached, which is a different claim from not knowing.
+    cachedEl.textContent = '(cache not reported)';
+  }else{
+    cachedEl.textContent = '';
+  }
+
+  // Then money. A rate or a count that is missing makes the corresponding
+  // half of the bill unknowable, and a partial sum presented as a total is
+  // exactly the error that makes a cheap-looking run look cheap.
+  const inRate     = pricing && pricing.input_usd_per_mtok;
+  const outRate    = pricing && pricing.output_usd_per_mtok;
+  const cachedRate = pricing && pricing.cached_input_usd_per_mtok;
+  let total = 0, missing = [], parts = [];
+
+  if(inKnown && typeof inRate === 'number'){
+    const hit  = cachedKnown ? tokCached : 0;
+    const miss = Math.max(tokIn - hit, 0);
+    // No published cached rate means the whole prompt bills at full price:
+    // an upper bound, never an invented discount.
+    const hitRate = (typeof cachedRate === 'number') ? cachedRate : inRate;
+    const cost = (miss*inRate + hit*hitRate) / 1e6;
+    total += cost;
+    parts.push(`in $${cost.toFixed(4)}`);
+  }else{
+    missing.push(inKnown ? 'input price' : 'input tokens');
+  }
+
+  if(outKnown && typeof outRate === 'number'){
+    const cost = tokOut*outRate / 1e6;
+    total += cost;
+    parts.push(`out $${cost.toFixed(4)}`);
+  }else{
+    missing.push(outKnown ? 'output price' : 'output tokens');
+  }
+
+  const costEl = document.querySelector('#cost');
+  const detailEl = document.querySelector('#cost-detail');
+  if(!parts.length){
+    costEl.textContent = '--';
+    // "No price" and "no tokens yet" are different problems and only one of
+    // them is worth acting on. Before the first call lands, the rates are
+    // fine and there is simply nothing to bill.
+    const haveRates = typeof inRate === 'number' || typeof outRate === 'number';
+    detailEl.textContent = haveRates ? '' : '(no price for this model)';
+    return;
+  }
+  costEl.textContent = '$' + total.toFixed(4);
+  detailEl.textContent = missing.length
+    ? `(${parts.join(' + ')} — no ${missing.join(', ')})`
+    : `(${parts.join(' + ')})`;
+}
+
 function append(id,html){
   const el=document.querySelector(id), stuck=atBottom(el);
   el.insertAdjacentHTML('beforeend',html);
@@ -172,8 +244,15 @@ function render(data){
   for(const e of (data.events||[])){
     if(e.at&&e.at>lastEventAt) lastEventAt=e.at;
     if(e.source==='llm'&&e.kind==='llm_call'){
-      calls++; const n=e.payload?.prompt_tokens;
-      if(typeof n==='number'){tokens+=n;tokensKnown=true}
+      calls++;
+      const p=e.payload||{};
+      // Each call's prompt_tokens is its WHOLE prompt, so this sum is billed
+      // input and climbs across a turn. It is not the context size.
+      if(typeof p.prompt_tokens==='number'){tokIn+=p.prompt_tokens;inKnown=true}
+      // cached_prompt_tokens is the discounted share OF that input, so it is
+      // never added to it -- only used to split it between two rates.
+      if(typeof p.cached_prompt_tokens==='number'){tokCached+=p.cached_prompt_tokens;cachedKnown=true}
+      if(typeof p.completion_tokens==='number'){tokOut+=p.completion_tokens;outKnown=true}
       continue;
     }
     if(e.source==='approver'){
@@ -223,10 +302,8 @@ function render(data){
   if(stuck)timeline.scrollTop=timeline.scrollHeight;
 
   document.querySelector('#calls').textContent=calls;
-  document.querySelector('#tokens').textContent=tokensKnown?tokens.toLocaleString():'--';
-  document.querySelector('#cost').textContent=tokensKnown
-    ? `(~$${(tokens*inputUsdPerMillion/1_000_000).toFixed(3)})`
-    : '';
+  if(data.pricing) pricing=data.pricing;
+  renderMoney();
   document.querySelector('#tools').textContent=toolCalls;
   document.querySelector('#tool-errors').textContent=toolErrors;
   document.querySelector('#repeats').textContent=repeatedActions;
@@ -406,6 +483,33 @@ def load_state(run_dir: Path, requested: str = "", cursor: int = 0,
         "problem": _problem(run_dir, selected) if selected else {},
         "diagnostics": _diagnostics(run_dir, selected, tasks) if selected else {},
         "logs": _log_tails(run_dir / "tasks" / selected) if selected else {},
+        "pricing": _pricing(run.get("model")),
+    }
+
+
+def _pricing(model: str | None) -> dict[str, Any]:
+    """The rates for this run's model, straight from ``models.json``.
+
+    Sent to the page rather than written into its JavaScript, because a price
+    duplicated in the client is a price that silently disagrees with the one
+    the exporter bills by -- and the viewer's number is the one somebody reads
+    while deciding whether to keep a run going.
+
+    A missing model or a missing rate yields ``None``, which the page shows as
+    "no price" rather than as a free run.
+    """
+    try:
+        from export_harness_bench_data import pricing_table
+    except ImportError:                                   # standalone viewer
+        return {}
+    prices, version = pricing_table()
+    rates = (prices.get(model or "") or {}).get("pricing") or {}
+    return {
+        "model": model,
+        "pricing_version": version,
+        "input_usd_per_mtok": rates.get("input_usd_per_mtok"),
+        "cached_input_usd_per_mtok": rates.get("cached_input_usd_per_mtok"),
+        "output_usd_per_mtok": rates.get("output_usd_per_mtok"),
     }
 
 

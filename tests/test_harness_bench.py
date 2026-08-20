@@ -79,12 +79,14 @@ def test_analysis_export_builds_joinable_sqlite_dataset(tmp_path: Path) -> None:
         # single call (200) is the separate question of how big it got.
         assert row[:6] == (1.0, 300, 200, 120, 180, 30)
         assert row[6] == 1                       # both counts on every call
-        # models.json prices input at $0.30/Mtok and publishes no cached rate,
-        # so the whole 300 bills at the full rate: 300 * 0.30 / 1e6.
-        assert row[7] == 0.00009
-        # Output has no published price, so output and total stay NULL rather
-        # than being quietly reported as a complete cost.
-        assert row[8] is None and row[9] is None
+        # MiniMax direct-API rates: $0.30/Mtok input, $0.06 cached, $1.20 out.
+        # 120 of the 300 billed input tokens were cache reads, so the input
+        # bill is split rather than charged twice:
+        #     180 * 0.30/1e6  +  120 * 0.06/1e6  =  0.000061
+        assert row[7] == 6.1e-05
+        assert row[8] == 3.6e-05                 # 30 * 1.20/1e6
+        assert row[9] == 9.7e-05                 # and they reconcile
+        assert round(row[7] + row[8], 6) == row[9]
         assert connection.execute("SELECT count(*) FROM oracle_checks").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM model_calls").fetchone()[0] == 2
     finally:
