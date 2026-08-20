@@ -77,7 +77,9 @@ def test_the_live_page_keeps_a_way_back_and_watches_the_job() -> None:
     a way back or notice the job finishing.
     """
     page = live_page("some-job").decode("utf-8")
-    assert 'href="/"' in page                      # back to the dashboard
+    # The same three tabs as every other page. A viewer you can only leave by
+    # editing the URL is what makes the console feel like two separate tools.
+    assert 'href="/"' in page and 'href="/data"' in page and 'href="/run"' in page
     assert 'id="jobstate"' in page                 # job-level status line
     assert "watchJob" in page                      # redirect-when-done poller
     # And the viewer's own machinery survived the injection.

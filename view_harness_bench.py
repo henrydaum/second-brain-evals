@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import socket
+import sys
 import threading
 import urllib.parse
 import webbrowser
@@ -14,6 +16,45 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_RESULTS = ROOT / "results" / "harness-bench"
+
+
+class PortInUse(RuntimeError):
+    """Something is already listening, and starting anyway would serve nobody."""
+
+
+def serve_on(host: str, port: int, handler: type) -> ThreadingHTTPServer:
+    """Bind, or fail loudly. Never bind alongside an existing listener.
+
+    **This exists because of a Windows-specific trap.** ``HTTPServer`` sets
+    ``allow_reuse_address = 1``, which on POSIX only shortens ``TIME_WAIT``.
+    On Windows it means ``SO_REUSEADDR``, and Windows lets a second socket
+    bind to a port another process is *actively listening on*. The second
+    server then starts cleanly, prints its URL, and receives nothing: the
+    first process keeps answering every request.
+
+    The symptom is bewildering rather than obvious -- a new server appears to
+    run while the browser shows the old one's pages, so the code looks broken
+    when it is merely unreachable. A probe first, and the reused address
+    switched off, turns that into a plain "port is taken" message.
+    """
+    probe = socket.socket()
+    probe.settimeout(0.35)
+    try:
+        if probe.connect_ex((host, port)) == 0:
+            raise PortInUse(
+                f"{host}:{port} is already in use -- most likely an earlier "
+                f"viewer or console you have not stopped.\n"
+                f"Stop it, or start this one with --port <other>.")
+    finally:
+        probe.close()
+
+    bound = type(handler.__name__ + "Bound", (handler,), {})
+    server_class = type("ExclusiveHTTPServer", (ThreadingHTTPServer,),
+                        {"allow_reuse_address": False})
+    try:
+        return server_class((host, port), bound)
+    except OSError as exc:                    # lost a race with another start
+        raise PortInUse(f"could not bind {host}:{port}: {exc}") from exc
 
 
 HTML = r"""<!doctype html>
@@ -283,7 +324,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"not a Harness-Bench run: {run_dir}")
     handler = type("BoundViewerHandler", (ViewerHandler,),
                    {"run_dir": run_dir, "run_spec": options.run})
-    server = ThreadingHTTPServer(("127.0.0.1", options.port), handler)
+    try:
+        server = serve_on("127.0.0.1", options.port, handler)
+    except PortInUse as exc:
+        print(exc, file=sys.stderr)
+        return 1
     url = f"http://127.0.0.1:{options.port}"
     print(f"Viewing {run_dir}\n{url}")
     if not options.no_open:

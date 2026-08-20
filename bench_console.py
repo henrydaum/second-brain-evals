@@ -27,11 +27,12 @@ import argparse
 import html
 import json
 import sqlite3
+import sys
 import threading
 import traceback
 import urllib.parse
 import webbrowser
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
 
@@ -394,11 +395,19 @@ def live_page(job_id: str) -> bytes:
     """
     body = view_harness_bench.HTML
     # Give the viewer the console's navigation without forking its markup.
+    # The same three tabs as every other page: a viewer you can only leave by
+    # editing the URL is the thing that makes the console feel like two
+    # separate tools instead of one.
+    nav = ('<nav style="font:13px system-ui">'
+           '<a href="/" style="margin-right:14px">Jobs</a>'
+           '<a href="/run" style="margin-right:14px;color:#fff;font-weight:600">Live</a>'
+           '<a href="/data">Data</a></nav>')
+    anchor = '<header><h1>Second Brain &middot; Harness-Bench</h1>'
+    assert anchor in body, "viewer header changed; live page nav injection missed"
     body = body.replace(
-        '<header><h1>Second Brain &middot; Harness-Bench</h1>',
-        '<header><h1><a href="/" style="color:inherit;text-decoration:none">'
-        '&larr; Second Brain &middot; Harness-Bench</a></h1>'
-        '<span id="jobstate" class="muted"></span>')
+        anchor,
+        '<header><h1>Second Brain &middot; Harness-Bench</h1>' + nav
+        + '<span id="jobstate" class="muted"></span>')
     watcher = """
 <script>
 // The job, as opposed to the task: the viewer polls one run directory, and
@@ -609,7 +618,14 @@ def main(argv: list[str] | None = None) -> int:
     api = HarnessBenchAPI()
     handler = type("BoundConsoleHandler", (ConsoleHandler,),
                    {"api": api, "runner": JobRunner(api)})
-    server = ThreadingHTTPServer(("127.0.0.1", options.port), handler)
+    try:
+        server = view_harness_bench.serve_on("127.0.0.1", options.port, handler)
+    except view_harness_bench.PortInUse as exc:
+        # Worth failing hard on: bound alongside an old viewer, this process
+        # would print a URL and then serve nobody while the stale server kept
+        # answering -- which reads as "the new code did not take effect".
+        print(exc, file=sys.stderr)
+        return 1
     url = f"http://127.0.0.1:{options.port}"
     print(f"Harness-Bench console: {url}\nResults: {RESULTS}\nCtrl+C to stop.")
     if not options.no_open:
