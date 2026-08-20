@@ -8,6 +8,7 @@ from driver.approver import Approver, Manifest
 from driver.wire import Frames
 from compare_harness_runs import compare_runs
 from audit_harness_bench import audit
+from export_harness_bench_data import export_runs
 from evals.harness_bench.drive_round import _manifest, _round_number
 from run_harness_bench import (
     BENCHMARK_TOOLS,
@@ -20,6 +21,7 @@ from run_harness_bench import (
     fetch_benchmark,
     find_official_result,
     provider_preflight,
+    snapshot_problem,
     stage_benchmark,
     summarize,
     task_score,
@@ -32,6 +34,45 @@ def test_benchmark_profile_only_removes_interactive_tools() -> None:
     assert "show_files" not in BENCHMARK_TOOLS
     assert {"run_command", "run_script", "web_search", "spawn_subagent"} <= BENCHMARK_TOOLS
 from view_harness_bench import HTML, load_state
+
+
+def test_analysis_export_builds_joinable_sqlite_dataset(tmp_path: Path) -> None:
+    import sqlite3
+
+    run = tmp_path / "run-1"
+    task = run / "tasks" / "task-1"
+    official = task / "official.json"
+    official.parent.mkdir(parents=True)
+    (run / "run.json").write_text(json.dumps({
+        "tasks": ["task-1"], "model": "minimax/MiniMax-M3", "mode": "yolo",
+        "task_metadata": {"task-1": {"title": "T", "difficulty": "easy", "class": "C"}},
+    }), encoding="utf-8")
+    (run / "summary.json").write_text(json.dumps({"tasks": []}), encoding="utf-8")
+    (task / "status.json").write_text(json.dumps({
+        "task_id": "task-1", "state": "complete", "model": "minimax/MiniMax-M3",
+        "outcome_score": 1.0, "elapsed_sec": 2.0, "official_result": "official.json",
+    }), encoding="utf-8")
+    official.write_text(json.dumps({"oracle_result": {"checks": [
+        {"id": "answer", "pass": True, "weight": 1.0, "detail": "ok"},
+    ]}}), encoding="utf-8")
+    (task / "events.jsonl").write_text(json.dumps({
+        "at": 1.0, "source": "llm", "kind": "llm_call",
+        "payload": {"model": "minimax/MiniMax-M3", "ok": True,
+                    "duration_s": 1.0, "prompt_tokens": 100},
+    }) + "\n", encoding="utf-8")
+
+    output = tmp_path / "dataset"
+    manifest = export_runs([run], output)
+    connection = sqlite3.connect(output / "harness_bench.sqlite")
+    try:
+        row = connection.execute(
+            "SELECT outcome_score, prompt_tokens_known, estimated_input_cost_usd FROM trials"
+        ).fetchone()
+        assert row == (1.0, 100, 0.00003)
+        assert connection.execute("SELECT count(*) FROM oracle_checks").fetchone()[0] == 1
+    finally:
+        connection.close()
+    assert manifest["trial_count"] == 1
 
 
 def test_pinned_release_has_all_tasks_and_pilot_covers_categories() -> None:
@@ -154,6 +195,11 @@ def test_viewer_loads_running_task_and_live_events(tmp_path: Path) -> None:
         json.dumps({"source": "second_brain", "frame": {"kind": "stream_delta", "payload": {"delta": "hello"}}}) + "\n",
         encoding="utf-8",
     )
+    (run / "tasks" / "a" / "problem.json").write_text(
+        json.dumps({"rounds": [{"round": 1, "file": "prompt.txt",
+                                "text": "Do the thing."}]}),
+        encoding="utf-8",
+    )
 
     state = load_state(run)
 
@@ -161,7 +207,16 @@ def test_viewer_loads_running_task_and_live_events(tmp_path: Path) -> None:
     assert state["tasks"][0]["title"] == "Task A"
     assert state["tasks"][1]["state"] == "pending"
     assert state["events"][0]["frame"]["payload"]["delta"] == "hello"
+    assert state["problem"]["rounds"][0]["text"] == "Do the thing."
+    assert 'id="timeline"' in HTML
+    assert 'id="decisions"' not in HTML and 'id="events"' not in HTML
     assert "Â" not in HTML and "â€" not in HTML
+
+
+def test_problem_snapshot_preserves_all_official_rounds() -> None:
+    problem = snapshot_problem(DEFAULT_BENCHMARK, "007-session-memory")
+    assert len(problem["rounds"]) == 2
+    assert "passphrase" in problem["rounds"][0]["text"].lower()
 
 
 def test_paired_comparison_requires_identical_tasks_and_counts_failures_as_zero(tmp_path: Path) -> None:

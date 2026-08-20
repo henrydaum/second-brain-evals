@@ -141,3 +141,36 @@ python compare_harness_runs.py minimax-yolo minimax-lockdown `
 
 See [docs/HARNESS_BENCH.md](docs/HARNESS_BENCH.md) for architecture, artifacts,
 scoring caveats, and troubleshooting.
+
+## Programmatic API and analysis data
+
+Run tasks from Python and receive the run summary, normalized trial rows, and
+SQLite dataset path:
+
+```python
+from harness_bench_api import HarnessBenchAPI, RunRequest
+
+result = HarnessBenchAPI().run_tasks(RunRequest(
+    task_ids=["034-evidence-matrix-claims"], mode="yolo",
+))
+print(result.summary)
+print(result.database)
+```
+
+The same API has a JSON command surface:
+
+```powershell
+python harness_bench_api.py tasks
+python harness_bench_api.py run --task 034-evidence-matrix-claims --mode yolo
+python harness_bench_api.py get medium-knowledge-1-a0e94b61
+```
+
+`harness_bench.sqlite` contains normalized `trials`, `oracle_checks`,
+`model_calls`, `tool_calls`, `approvals`, and lossless `events` tables, plus
+`trial_efficiency` and `failed_checks` views. CSV mirrors and `events.jsonl`
+are included for notebooks and interchange. Existing runs can be exported with:
+
+```powershell
+python export_harness_bench_data.py --run RUN_ID `
+  --output results\harness-bench\analysis\my-sample
+```

@@ -29,7 +29,10 @@ def _response(body: dict) -> tuple[dict, str]:
         return ({"role": "assistant", "content": "Done.", "tool_calls": []}, "stop")
     workspace = _workspace(messages)
     arguments = json.dumps({
-        "command": "mkdir -p out && wc -l < in/input.txt | tr -d ' ' > out/linecount.txt",
+        "command": (
+            "if test -r /work/harnessbench/tasks/001-file/oracle_grade.py; then exit 77; fi; "
+            "mkdir -p out && wc -l < in/input.txt | tr -d ' ' > out/linecount.txt"
+        ),
         "cwd": workspace,
         "narration": "counting the fixture lines and writing the required output",
     })

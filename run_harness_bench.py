@@ -201,6 +201,17 @@ def validate_benchmark(root: Path) -> dict[str, Any]:
     dirty = git(root, "status", "--porcelain", "--untracked-files=no")
     if dirty:
         raise RuntimeError("Harness-Bench checkout has modified tracked files; refusing a non-reproducible run:\n" + dirty)
+    config_result = subprocess.run(
+        ["git", "-C", str(root), "config", "--get", "core.autocrlf"],
+        capture_output=True, text=True, check=False,
+    )
+    autocrlf = config_result.stdout.strip()
+    if autocrlf.lower() not in {"false", "input"}:
+        raise RuntimeError(
+            "Harness-Bench must be materialized with core.autocrlf=false. "
+            "Its fixture oracles hash canonical bytes, so CRLF conversion creates false integrity failures. "
+            "Run --fetch-benchmark to repair the ignored benchmark checkout."
+        )
     tasks: dict[str, dict[str, Any]] = {}
     for manifest in sorted((root / "tasks").glob("*/task.yaml")):
         data = yaml.safe_load(manifest.read_text(encoding="utf-8")) or {}
@@ -229,13 +240,18 @@ def fetch_benchmark(root: Path) -> None:
     """Materialize the external benchmark without vendoring its unlicensed tree."""
     if not root.exists():
         root.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["git", "clone", LOCK["repository"], str(root)], check=True)
+        subprocess.run(["git", "-c", "core.autocrlf=false", "clone", LOCK["repository"], str(root)], check=True)
     elif not (root / ".git").is_dir():
         raise RuntimeError(f"benchmark root exists but is not a Git checkout: {root}")
     current = git(root, "rev-parse", "HEAD")
     if current != LOCK["commit"]:
         subprocess.run(["git", "-C", str(root), "fetch", "origin", LOCK["commit"]], check=True)
         subprocess.run(["git", "-C", str(root), "checkout", "--detach", LOCK["commit"]], check=True)
+    # Harness-Bench embeds canonical MD5s for fixture-integrity checks. On
+    # Windows, a global core.autocrlf=true silently rewrites those fixtures
+    # while leaving Git's status clean, producing false agent penalties.
+    subprocess.run(["git", "-C", str(root), "config", "core.autocrlf", "false"], check=True)
+    subprocess.run(["git", "-C", str(root), "checkout-index", "--all", "--force"], check=True)
 
 
 def choose_tasks(options: argparse.Namespace, available: dict[str, Any]) -> list[str]:
@@ -291,6 +307,7 @@ def self_test(benchmark: Path, image: str) -> None:
             if fake_start.returncode:
                 raise RuntimeError(fake_start.stderr or "could not start fake provider")
             time.sleep(0.25)
+            protect_benchmark_assets(name)
             command = (
                 "PYTHONPATH=/work/harnessbench/src "
                 "HARNESSBENCH_APP_CONFIG=/work/harnessbench/config/app.json "
@@ -299,7 +316,7 @@ def self_test(benchmark: Path, image: str) -> None:
                 "HARNESSBENCH_SKIP_ORACLE_QUALITY_LLM=1 "
                 "python -m harnessbench.cli run-task --task 001-file --harness demo --mode demo"
             )
-            demo = docker("exec", name, "sh", "-c", command)
+            demo = docker("exec", "-u", "0", name, "sh", "-c", command)
             if demo.returncode:
                 raise RuntimeError("official demo run failed:\n" + demo.stdout + demo.stderr)
             result = docker(
@@ -311,7 +328,7 @@ def self_test(benchmark: Path, image: str) -> None:
             if score != 1.0:
                 raise RuntimeError(f"official demo oracle returned {score!r}, expected 1.0")
             agent_command = command.replace("--harness demo --mode demo", "--harness second-brain --mode live")
-            agent = docker("exec", name, "sh", "-c", agent_command)
+            agent = docker("exec", "-u", "0", name, "sh", "-c", agent_command)
             if agent.returncode:
                 raise RuntimeError("Second Brain fake-provider task failed:\n" + agent.stdout + agent.stderr)
             found = docker("exec", name, "sh", "-c", "find /work/harnessbench/results -name 001-file.json -path '*second-brain*' -print -quit")
@@ -409,6 +426,7 @@ def open_run(options, tasks, model, metadata, image_id):
 def run_one_task(*, task_id, task_dir, benchmark, env_file, image, mode, model,
                  keep_container, position):
     task_dir.mkdir(parents=True, exist_ok=True)
+    write_json(task_dir / "problem.json", snapshot_problem(benchmark, task_id))
     status = {"task_id": task_id, "state": "running", "started_at": time.time(), "mode": mode, "model": model}
     write_json(task_dir / "status.json", status)
     container = safe_container_name(f"sb-hb-{task_id}-{uuid.uuid4().hex[:6]}")
@@ -421,10 +439,11 @@ def run_one_task(*, task_id, task_dir, benchmark, env_file, image, mode, model,
             stage_benchmark(benchmark, stage, task_id, mode, model)
             run_container(container, image, env_file)
             copy_into(container, stage, "/work/harnessbench")
+            protect_benchmark_assets(container)
             tail, event_thread = stream_events(container, task_dir / "events.jsonl")
             print(f"[{position}] {task_id}: running", flush=True)
             command = [
-                docker_exe(), "exec",
+                docker_exe(), "exec", "-u", "0",
                 "-e", "PYTHONPATH=/work/harnessbench/src",
                 "-e", "PYTHONIOENCODING=utf-8",
                 "-e", "PYTHONUTF8=1",
@@ -494,6 +513,24 @@ def run_one_task(*, task_id, task_dir, benchmark, env_file, image, mode, model,
     return status
 
 
+def snapshot_problem(benchmark: Path, task_id: str) -> dict[str, Any]:
+    """Copy the official problem text beside the run for live inspection."""
+    root = benchmark / "tasks" / task_id
+    manifest = yaml.safe_load((root / "task.yaml").read_text(encoding="utf-8")) or {}
+    names = list(manifest.get("prompt_files") or [])
+    if not names and manifest.get("prompt_file"):
+        names = [manifest["prompt_file"]]
+    return {
+        "task_id": task_id,
+        "title": manifest.get("title"),
+        "rounds": [
+            {"round": index, "file": name,
+             "text": (root / name).read_text(encoding="utf-8")}
+            for index, name in enumerate(names, 1)
+        ],
+    }
+
+
 def stage_benchmark(source: Path, dest: Path, task_id: str, mode: str, model: str) -> None:
     shutil.copytree(source / "src", dest / "src")
     shutil.copytree(source / "grading", dest / "grading")
@@ -514,7 +551,7 @@ def stage_benchmark(source: Path, dest: Path, task_id: str, mode: str, model: st
         "model": model,
         "session_prefix": "second-brain-harnessbench",
         "args": [
-            "/opt/sb-evals/drive_round.py",
+            "/opt/sb-evals/isolated_driver.py",
             "--workspace", "{workspace}",
             "--prompt-file", "{prompt_file}",
             "--sandbox", "{sandbox}",
@@ -535,6 +572,22 @@ def stage_benchmark(source: Path, dest: Path, task_id: str, mode: str, model: st
             "--wall-seconds", str(max(30, task_timeout(source, task_id) - DRIVER_COLLECT_MARGIN_S)),
         ],
     }}})
+
+
+def protect_benchmark_assets(container: str) -> None:
+    targets = [f"{CONTAINER_BENCH_ROOT}/tasks", f"{CONTAINER_BENCH_ROOT}/grading"]
+    owned = docker("exec", "-u", "0", container, "chown", "-R", "0:0", *targets)
+    if owned.returncode:
+        raise RuntimeError("could not take ownership of benchmark oracle assets: " + owned.stderr)
+    protected = docker("exec", "-u", "0", container, "chmod", "-R", "go-rwx", *targets)
+    if protected.returncode:
+        raise RuntimeError("could not protect benchmark oracle assets: " + protected.stderr)
+    # Node is an oracle dependency, not a bundled agent capability. The root
+    # scorer can execute it; Second Brain (UID 1000) cannot and remains free to
+    # install a workspace-local runtime using its own tools.
+    hidden_runtime = docker("exec", "-u", "0", container, "chmod", "700", "/usr/bin/node")
+    if hidden_runtime.returncode:
+        raise RuntimeError("could not reserve Node for the scorer: " + hidden_runtime.stderr)
 
 
 def task_timeout(source: Path, task_id: str) -> int:
