@@ -43,7 +43,6 @@ Pi's own Harbor adapter.
 
 ## Expectations
 
-This is Second Brain's weakest domain: coding-native harnesses will beat it.
 A respectable mid-table score is the goal, and its purpose is to make the
 security claims from Boundary-Bench and AgentDojo read as "capable system that
 is also safe" rather than "safe because it cannot do anything".
