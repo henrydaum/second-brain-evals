@@ -8,6 +8,7 @@ import statistics
 from pathlib import Path
 from typing import Any
 
+from run_harness_bench import task_score
 from view_harness_bench import resolve_run
 
 
@@ -72,9 +73,12 @@ def _load_run(path: Path) -> dict[str, Any]:
 
 
 def _task_score(run_dir: Path, task_id: str) -> float:
-    status = _json(run_dir / "tasks" / task_id / "status.json") or {}
-    value = status.get("outcome_score") if status.get("state") == "complete" else 0.0
-    return float(value) if isinstance(value, (int, float)) else 0.0
+    """One task's contribution, scored by the launcher's own definition.
+
+    Imported rather than reimplemented so a comparison's per-task deltas
+    always reconcile with the ``completion_score`` printed beside them.
+    """
+    return task_score(_json(run_dir / "tasks" / task_id / "status.json"))
 
 
 def _identity(path: Path, data: dict[str, Any]) -> dict[str, Any]:

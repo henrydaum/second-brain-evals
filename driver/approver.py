@@ -35,6 +35,8 @@ import threading
 import time
 import urllib.parse
 
+from driver import live
+
 #: What a family carries in ``detail``, per ``docs/HTTP_PROTOCOL.md``.
 #: ``proc.*``: command / cwd / prefixes. ``net.http``: method / url.
 #: ``fs.*``: path / dst. Everything else: subject.
@@ -206,6 +208,12 @@ class Approver:
         # request ids that were settled minutes ago, and logging decisions it
         # never actually made.
         self._since = client.frames.mark() if since is None else since
+        # Decisions go to the live log as well as to ``decisions``. The
+        # in-memory list is only readable once the bundle is written, which
+        # is after the task is over -- and *which* requests a mode refused,
+        # and why, is the whole content of a lockdown-versus-yolo comparison.
+        # Watching that happen is worth more than reading it afterwards.
+        self._live = live.shared()
         self._seen = set()
         self._open = set()
         self._lock = threading.Lock()
@@ -288,6 +296,14 @@ class Approver:
         record["resolve_status"] = status
         record["resolve_answer"] = answer
         record["latency_s"] = round(time.time() - seen_at, 3)
+        self._live.write("approver", "decision",
+                         payload={"request_id": request_id,
+                                  "type": detail.get("type"),
+                                  "asker": detail.get("asker"),
+                                  "subject": _subject_of(detail),
+                                  "choice": choice, "why": why,
+                                  "resolve_status": status,
+                                  "latency_s": record["latency_s"]})
         with self._lock:
             self._open.discard(request_id)
 
@@ -332,6 +348,13 @@ class Approver:
         record["resolve_status"] = status
         record["resolve_answer"] = answer
         record["latency_s"] = round(time.time() - seen_at, 3)
+        self._live.write("approver", "question",
+                         payload={"request_id": request_id,
+                                  "title": payload.get("title"),
+                                  "type": payload.get("type"),
+                                  "answer": value,
+                                  "resolve_status": status,
+                                  "latency_s": record["latency_s"]})
         with self._lock:
             self._open.discard(request_id)
 

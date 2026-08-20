@@ -32,6 +32,8 @@ import time
 import urllib.error
 import urllib.request
 
+from driver import live
+
 #: The kernel binds loopback only, so a driver runs inside the container.
 DEFAULT_BASE = os.environ.get("SB_BASE_URL", "http://127.0.0.1:8787")
 DEFAULT_TOKEN = os.environ.get("SB_HTTP_TOKEN", "")
@@ -56,10 +58,10 @@ class Frames:
         self._frames = []
         self._lock = threading.Lock()
         self._sink = open(path, "a", encoding="utf-8") if path else None
-        live_path = os.environ.get("SB_LIVE_EVENT_LOG")
-        if live_path:
-            os.makedirs(os.path.dirname(live_path) or ".", exist_ok=True)
-        self._live_sink = open(live_path, "a", encoding="utf-8") if live_path else None
+        # The viewer's copy. Shared with the approver and -- across a process
+        # boundary -- with the kernel's LLM telemetry, so it goes through
+        # ``driver.live`` rather than a second bare handle on the same file.
+        self._live = live.shared()
 
     def append(self, frame):
         with self._lock:
@@ -69,10 +71,10 @@ class Frames:
                 # still have every frame up to the moment it died.
                 self._sink.write(json.dumps(frame, ensure_ascii=False) + "\n")
                 self._sink.flush()
-            if self._live_sink is not None:
-                event = {"at": time.time(), "source": "second_brain", "frame": frame}
-                self._live_sink.write(json.dumps(event, ensure_ascii=False) + "\n")
-                self._live_sink.flush()
+        # Outside the frame lock: ``live`` keeps its own, and holding both in
+        # a fixed order here would be one more ordering to get right for no
+        # gain.
+        self._live.write("second_brain", "frame", frame=frame)
 
     def snapshot(self, since=0):
         with self._lock:
@@ -91,9 +93,7 @@ class Frames:
             if self._sink is not None:
                 self._sink.close()
                 self._sink = None
-            if self._live_sink is not None:
-                self._live_sink.close()
-                self._live_sink = None
+        # The live log is shared; it is not this object's to close.
 
     def __len__(self):
         with self._lock:

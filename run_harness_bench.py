@@ -44,6 +44,9 @@ CONTAINER_BENCH_ROOT = "/work/harnessbench"
 # or data roots. Keeping official task sandboxes in the agent data workspace
 # makes the real workspace reachable without weakening that production rule.
 CONTAINER_WORK_ROOT = "/data/Second Brain/workspace/harnessbench-sandboxes"
+#: Seconds reserved out of a task's official timeout for the driver to end its
+#: turn and write its result bundle. See ``stage_benchmark``.
+DRIVER_COLLECT_MARGIN_S = 90
 PROVIDER_PATTERNS = (
     "usage limit reached",
     "quota exceeded",
@@ -138,21 +141,42 @@ def main(argv: list[str] | None = None) -> int:
         if previous and not options.retry_failed and previous.get("state") not in ("pending", "interrupted"):
             print(f"[{index}/{len(tasks)}] {task_id}: {previous.get('state')} (use --retry-failed)")
             continue
-        result = run_one_task(
-            task_id=task_id,
-            task_dir=task_dir,
-            benchmark=benchmark,
-            env_file=env_file,
-            image=options.image,
-            mode=options.mode,
-            model=model,
-            keep_container=options.keep_container,
-            position=f"{index}/{len(tasks)}",
-        )
+        try:
+            result = run_one_task(
+                task_id=task_id,
+                task_dir=task_dir,
+                benchmark=benchmark,
+                env_file=env_file,
+                image=options.image,
+                mode=options.mode,
+                model=model,
+                keep_container=options.keep_container,
+                position=f"{index}/{len(tasks)}",
+            )
+        except KeyboardInterrupt:
+            # A *second* Ctrl+C, landing while the first one's cleanup was
+            # still copying evidence out of the container. Take it as "stop
+            # now", but still write the summary on the way out so the run
+            # directory is resumable rather than half-described.
+            print(f"\nInterrupted during cleanup; stopping. "
+                  f"Resume with: --resume {run_dir}", flush=True)
+            exit_code = 130
+            break
         write_json(run_dir / "summary.json", summarize(run_dir, tasks))
         if result.get("state") == "provider_unavailable":
             print("Provider quota/credit failure detected; stopping before another task is scheduled.")
             exit_code = 75
+            break
+        if result.get("state") == "interrupted":
+            # Ctrl+C is caught inside ``run_one_task`` so the active task's
+            # container is still torn down and its partial evidence still
+            # collected. That made the *interrupt* clean and the *run* not:
+            # without this branch the loop simply started the next container
+            # and the next paid task, so the only way out was to keep
+            # pressing Ctrl+C and hope one landed between two ``try`` blocks.
+            print("Interrupted; stopping. Resume with: "
+                  f"--resume {run_dir}", flush=True)
+            exit_code = 130
             break
         if result.get("state") not in ("complete",):
             exit_code = 1
@@ -435,10 +459,18 @@ def run_one_task(*, task_id, task_dir, benchmark, env_file, image, mode, model,
 
     official = find_official_result(task_dir, task_id)
     provider_error = detect_provider_failure(task_dir)
-    if provider_error:
-        status["state"] = "provider_unavailable"
-        status["provider_error"] = provider_error
-    elif official:
+    # **An official result outranks a provider complaint, and the order here
+    # is the whole point.** ``detect_provider_failure`` greps the logs for
+    # phrases like ``rate_limit_error``, and a provider client that *retried
+    # a 429 and then succeeded* logs exactly that phrase on its way to a
+    # finished task. Checking the complaint first threw away a real oracle
+    # score, recorded the task as a zero, and stopped the whole run -- on a
+    # rate-limited provider, which is to say on the runs where it matters.
+    #
+    # So a task that produced a result is scored, and the complaint is kept
+    # beside it as ``provider_warning`` rather than discarded: a run littered
+    # with those is worth knowing about even when every task completed.
+    if official:
         status["state"] = "complete"
         status["official_result"] = str(official.relative_to(task_dir)).replace("\\", "/")
         payload = read_json(official) or {}
@@ -446,6 +478,11 @@ def run_one_task(*, task_id, task_dir, benchmark, env_file, image, mode, model,
         status["combined_score"] = ((payload.get("scoring") or {}).get("combined_score"))
         status["adapter_ok"] = ((payload.get("adapter_result") or {}).get("ok"))
         status["elapsed_sec"] = payload.get("elapsed_sec")
+        if provider_error:
+            status["provider_warning"] = provider_error
+    elif provider_error:
+        status["state"] = "provider_unavailable"
+        status["provider_error"] = provider_error
     elif status.get("state") == "running":
         status["state"] = "harness_error"
         status["error"] = f"Harness-Bench exited {returncode} without a result"
@@ -483,7 +520,19 @@ def stage_benchmark(source: Path, dest: Path, task_id: str, mode: str, model: st
             "--sandbox", "{sandbox}",
             "--task-id", "{task_id}",
             "--security-mode", mode,
-            "--wall-seconds", str(max(30, task_timeout(source, task_id) - 30)),
+            # The driver must finish *and write its bundle* before the
+            # adapter's own ``subprocess.run(timeout=...)`` fires, because
+            # upstream's ``run-task`` path does not catch ``TimeoutExpired``:
+            # it propagates, no result file is written, and the oracle never
+            # runs -- so a task the agent had mostly finished scores a hard
+            # zero instead of the partial credit its workspace had earned.
+            #
+            # The margin has to cover everything after the turn ends, and
+            # that is not free: paging the whole transcript back out of
+            # ``conv.read``, reading the ledger, and SHA-256'ing every file
+            # in the workspace. 30 seconds was cutting it fine on a task with
+            # a large output tree.
+            "--wall-seconds", str(max(30, task_timeout(source, task_id) - DRIVER_COLLECT_MARGIN_S)),
         ],
     }}})
 
@@ -554,6 +603,23 @@ def print_live_event(line: str) -> None:
 
 
 def collect_container(container: str, task_dir: Path) -> None:
+    """Copy the container's evidence out, replacing any earlier attempt's copy.
+
+    **The destination is removed first, and that is load-bearing.** ``docker
+    cp`` chooses between two behaviours based on whether the destination
+    already exists: a missing destination is *created* holding the source's
+    contents, while an existing one receives the source *nested inside it*.
+    On a ``--retry-failed`` pass the first attempt has already created
+    ``official-results/``, so a second copy lands at
+    ``official-results/results/...`` and the tree now holds two results for
+    one task. :func:`find_official_result` then refuses to guess between them
+    and the retry is recorded as a harness error -- with a perfectly good
+    oracle score sitting on disk.
+
+    Removing first also keeps the bundle honest in the ordinary direction: a
+    retry's evidence is the retry's, never a merge of two runs whose files
+    happen not to collide.
+    """
     if not container_exists(container):
         return
     for remote, local in (
@@ -561,6 +627,7 @@ def collect_container(container: str, task_dir: Path) -> None:
         (CONTAINER_WORK_ROOT, task_dir / "sandboxes"),
         ("/work/live", task_dir / "live"),
     ):
+        shutil.rmtree(local, ignore_errors=True)
         local.parent.mkdir(parents=True, exist_ok=True)
         docker("cp", f"{container}:{remote}", str(local), check=False)
 
@@ -585,18 +652,52 @@ def detect_provider_failure(task_dir: Path) -> str | None:
     return None
 
 
+def task_score(status: dict[str, Any] | None) -> float:
+    """The one number a scheduled task contributes to the mean.
+
+    **The single definition, deliberately.** ``compare_harness_runs`` imports
+    this rather than reimplementing it: two scorers that disagree about what
+    an unfinished task is worth produce a comparison whose per-task deltas do
+    not add up to the aggregate printed beside them, and the disagreement is
+    invisible because both numbers look reasonable on their own.
+
+    Everything that is not a complete run with a numeric oracle score is
+    zero. That is harsher than it needs to be for a harness error and it is
+    meant to be: a benchmark that quietly excuses its own failures reports a
+    mean over the runs that happened to work.
+    """
+    status = status or {}
+    if status.get("state") != "complete":
+        return 0.0
+    value = status.get("outcome_score")
+    # ``bool`` is an ``int``. An oracle answering True/False is answering a
+    # score of 1.0/0.0, which is what float() already makes of it.
+    return float(value) if isinstance(value, (int, float)) else 0.0
+
+
 def summarize(run_dir: Path, task_ids: list[str]) -> dict[str, Any]:
     rows = []
-    scores = []
+    scores: list[float] = []
+    unscored = 0
     llm_calls = 0
     prompt_tokens = 0
     calls_with_tokens = 0
     for task_id in task_ids:
         status = read_json(run_dir / "tasks" / task_id / "status.json") or {"task_id": task_id, "state": "pending"}
         rows.append(status)
-        value = status.get("outcome_score") if status.get("state") == "complete" else 0.0
-        if isinstance(value, (int, float)):
-            scores.append(float(value))
+        # Every scheduled task contributes exactly one score, and the only
+        # question is whether it is the oracle's or a zero. Anything short of
+        # a complete run scores zero, and so does a *complete* run whose
+        # oracle declined to produce a number -- an unscored task silently
+        # dropped from the list would shrink the divisor rather than the
+        # score, which is precisely the exception filtering the denominator
+        # is meant to prevent. ``unscored`` is reported beside the mean so a
+        # reader can tell "the agent failed 3" from "the oracle answered
+        # nothing 3 times", which are very different problems.
+        scores.append(task_score(status))
+        if status.get("state") == "complete" and not isinstance(
+                status.get("outcome_score"), (int, float)):
+            unscored += 1
         for event in read_jsonl(run_dir / "tasks" / task_id / "events.jsonl"):
             if event.get("source") != "llm" or event.get("kind") != "llm_call":
                 continue
@@ -613,6 +714,7 @@ def summarize(run_dir: Path, task_ids: list[str]) -> dict[str, Any]:
         "provider_unavailable": sum(1 for row in rows if row.get("state") == "provider_unavailable"),
         "completion_score": round(statistics.mean(scores), 6) if scores else None,
         "score_denominator": len(task_ids),
+        "completed_without_oracle_score": unscored,
         "llm_usage": {
             "calls": llm_calls,
             "calls_with_prompt_tokens": calls_with_tokens,

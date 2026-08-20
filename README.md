@@ -86,10 +86,26 @@ Start the viewer in a second terminal after a run directory has been created:
 python view_harness_bench.py --run latest
 ```
 
-The local UI at <http://127.0.0.1:8765> updates once per second and shows model
-text, tool activity, approvals, errors, model-call count, known prompt tokens,
-task state, and oracle scores. The underlying JSONL trace, official result,
-sandbox, and logs remain in `results/harness-bench/<run-id>/tasks/<task-id>/`.
+The local UI at <http://127.0.0.1:8765> polls once per second and shows:
+
+- streaming model output, appended rather than redrawn, so it does not scroll
+  back to the top under you while the agent is talking;
+- **approval decisions as they are made** — request type, subject, allow/deny,
+  and the manifest's reason — which is the panel a lockdown-versus-yolo
+  comparison is actually about;
+- tool activity and errors, model calls, known prompt tokens, tool-call count,
+  and a running allowed/denied tally;
+- the tail of `harness.log` and `container.log`, so a task that died says why
+  instead of sitting frozen at "running";
+- a liveness badge driven by the age of the newest event, because a dead
+  container otherwise looks identical to a thinking one.
+
+It follows the running task as the run advances; clicking a task pins it. Each
+poll transfers only the events since the last one, so cost stays proportional
+to what happened rather than to how long the task has been going.
+
+The underlying JSONL trace, official result, sandbox, and logs remain in
+`results/harness-bench/<run-id>/tasks/<task-id>/`.
 
 ## Security modes
 
@@ -102,6 +118,13 @@ The benchmark keeps the Essentials bundle except for the interactive-only
 Telegram frontend, `ask_question`, and `show_files`. All other Essentials tools
 remain available. The exact profile and store commit are recorded in the
 template manifest and each run.
+
+A mode is a standing answer to an approval dialog and nothing else, so a
+`lockdown`-versus-`yolo` delta measures the cost of refusing shell, scripting,
+and network — **not** file work, which is free in both because the task
+workspace sits in the agent's own scratch tree. See
+[docs/HARNESS_BENCH.md](docs/HARNESS_BENCH.md#security-modes-and-what-a-mode-comparison-actually-measures)
+before reporting one; the caveat changes how the number should be read.
 
 Use identical task selections, model configuration, timeouts, and benchmark
 revision when comparing modes or frameworks. MiniMax M3 is useful for cheap

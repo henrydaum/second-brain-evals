@@ -1,6 +1,10 @@
 import json
+import shutil
+import threading
 from pathlib import Path
 
+from driver import live
+from driver.approver import Approver, Manifest
 from driver.wire import Frames
 from compare_harness_runs import compare_runs
 from audit_harness_bench import audit
@@ -9,12 +13,16 @@ from run_harness_bench import (
     BENCHMARK_TOOLS,
     CONTAINER_WORK_ROOT,
     DEFAULT_BENCHMARK,
+    DRIVER_COLLECT_MARGIN_S,
     ProviderUnavailableError,
     SELECTIONS,
+    detect_provider_failure,
     fetch_benchmark,
+    find_official_result,
     provider_preflight,
     stage_benchmark,
     summarize,
+    task_score,
     validate_benchmark,
 )
 
@@ -80,7 +88,10 @@ def test_stage_uses_generic_cli_and_requested_mode(tmp_path: Path) -> None:
     assert model["model"] == "minimax/MiniMax-M3"
     assert model["args"][model["args"].index("--security-mode") + 1] == "lockdown"
     assert model["args"][-2] == "--wall-seconds"
-    assert float(model["args"][-1]) == 570.0
+    # The driver must return *and write its bundle* inside the official
+    # timeout, because upstream's run-task path does not catch a subprocess
+    # timeout: it propagates, no result is written, and the oracle never runs.
+    assert float(model["args"][-1]) == 600.0 - DRIVER_COLLECT_MARGIN_S
     app = json.loads((stage / "config" / "app.json").read_text(encoding="utf-8"))
     assert app["work_root"] == CONTAINER_WORK_ROOT
     assert app["work_root"].startswith("/data/Second Brain/workspace/")
@@ -177,3 +188,221 @@ def test_paired_comparison_requires_identical_tasks_and_counts_failures_as_zero(
 
     assert report["candidate_delta"] == -0.5
     assert (report["wins"], report["ties"], report["losses"]) == (0, 1, 1)
+
+
+def test_an_unscored_completion_is_a_zero_not_a_smaller_denominator(tmp_path: Path) -> None:
+    """The bug this pins was invisible in exactly the way that matters.
+
+    A task that ran to completion but whose oracle produced no number used to
+    be dropped from the score list entirely, so the mean divided by a smaller
+    denominator while ``score_denominator`` still reported the full one. The
+    benchmark's headline claim is that failures stay in the denominator; this
+    was the one case where they did not.
+    """
+    run = tmp_path / "run"
+    for task_id, status in (
+        ("a", {"state": "complete", "outcome_score": 1.0}),
+        ("b", {"state": "complete", "outcome_score": None}),
+        ("c", {"state": "complete"}),
+        ("d", {"state": "harness_error"}),
+    ):
+        folder = run / "tasks" / task_id
+        folder.mkdir(parents=True)
+        (folder / "status.json").write_text(json.dumps(status), encoding="utf-8")
+
+    summary = summarize(run, ["a", "b", "c", "d"])
+
+    assert summary["completion_score"] == 0.25
+    assert summary["score_denominator"] == 4
+    assert summary["completed_without_oracle_score"] == 2
+
+
+def test_one_scorer_serves_the_launcher_and_the_comparison() -> None:
+    """Two definitions of "what is an unfinished task worth" is one too many.
+
+    A comparison whose per-task deltas do not reconcile with the aggregate
+    printed beside them is worse than no comparison, because both numbers
+    look reasonable alone.
+    """
+    from compare_harness_runs import _task_score as compare_scorer
+
+    assert compare_scorer.__module__ == "compare_harness_runs"
+    assert task_score({"state": "complete", "outcome_score": 0.5}) == 0.5
+    assert task_score({"state": "complete", "outcome_score": None}) == 0.0
+    assert task_score({"state": "harness_error", "outcome_score": 1.0}) == 0.0
+    assert task_score(None) == 0.0
+
+
+def test_a_retried_rate_limit_does_not_discard_a_finished_task(tmp_path: Path) -> None:
+    """A provider complaint in the log is not a provider failure.
+
+    LiteLLM logs ``rate_limit_error`` on its way to a *successful* retry, so
+    checking the log before checking for a result threw away real oracle
+    scores and stopped the run -- on rate-limited providers, which is to say
+    on the runs where it happens.
+    """
+    task_dir = tmp_path / "tasks" / "x"
+    (task_dir / "official-results").mkdir(parents=True)
+    (task_dir / "harness.log").write_text(
+        "litellm.RateLimitError: rate_limit_error, retrying in 2s\nok\n", encoding="utf-8")
+
+    assert detect_provider_failure(task_dir) is not None      # still detected
+    result = task_dir / "official-results" / "x.json"
+    result.write_text(json.dumps({"oracle_result": {"outcome_score": 1.0}}), encoding="utf-8")
+    assert find_official_result(task_dir, "x") == result       # and outranked
+
+
+def test_a_second_attempt_replaces_the_first_bundle_rather_than_nesting(tmp_path: Path) -> None:
+    """``docker cp`` nests into an existing destination, and that broke retries.
+
+    The first attempt creates ``official-results/``; without removing it the
+    second copy lands at ``official-results/results/...`` and the tree holds
+    two results for one task. ``find_official_result`` then refuses to guess
+    and a passing retry is recorded as a harness error.
+    """
+    task_dir = tmp_path / "tasks" / "x"
+    first = task_dir / "official-results" / "second-brain" / "unknown-api"
+    first.mkdir(parents=True)
+    (first / "x.json").write_text("{}", encoding="utf-8")
+
+    nested = task_dir / "official-results" / "results" / "second-brain" / "unknown-api"
+    nested.mkdir(parents=True)
+    (nested / "x.json").write_text("{}", encoding="utf-8")
+    assert find_official_result(task_dir, "x") is None          # the failure
+
+    shutil.rmtree(task_dir / "official-results", ignore_errors=True)
+    fresh = task_dir / "official-results" / "second-brain" / "unknown-api"
+    fresh.mkdir(parents=True)
+    (fresh / "x.json").write_text("{}", encoding="utf-8")
+    assert find_official_result(task_dir, "x") == fresh / "x.json"
+
+
+def test_approval_decisions_reach_the_live_log(tmp_path: Path, monkeypatch) -> None:
+    """Which requests a mode refused, and why, is the content of a mode study.
+
+    ``decisions`` is only readable once the bundle is written, which is after
+    the task is over. A lockdown run is worth watching while it happens.
+    """
+    monkeypatch.setenv("SB_LIVE_EVENT_LOG", str(tmp_path / "events.jsonl"))
+    live.reset()
+
+    class _Client:
+        def __init__(self) -> None:
+            self.frames = Frames()
+
+        def post(self, kind, args=None, timeout=None):
+            return 200, {"ok": True}
+
+    approver = Approver(_Client(), Manifest({"default": "deny"}), log=None)
+    approver._handle({"id": "r1", "detail": {"type": "proc.run", "command": "rm -rf /tmp/x"},
+                      "enum": ["allow", "deny"]})
+    approver._answer_question({"id": "r2", "title": "Approve mode?", "type": "boolean"}, 0.0)
+    live.shared().close()
+
+    rows = [json.loads(line) for line
+            in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    decision = next(r for r in rows if r.get("kind") == "decision")
+    assert decision["source"] == "approver"
+    assert decision["payload"]["choice"] == "deny"
+    assert decision["payload"]["type"] == "proc.run"
+    assert "no rule for proc.run" in decision["payload"]["why"]
+    question = next(r for r in rows if r.get("kind") == "question")
+    assert question["payload"]["answer"] is True
+
+
+def test_the_mode_grant_is_recorded_even_though_it_is_not_a_permission_gate() -> None:
+    """``/mode yolo`` is gated, and its dialog carries no ``detail``.
+
+    So it arrives as a *question* rather than a permission gate and is
+    answered by the ``canned`` UI policy rather than by the manifest -- which
+    is why a ``{"default": "deny"}`` manifest does not refuse the very mode
+    the run is trying to measure. Pinned because a kernel change that gave
+    that dialog a ``detail`` would silently fail every YOLO run: the manifest
+    would deny it, the mode would stay ``ask``, and the run would quietly
+    measure the wrong configuration.
+    """
+    approver = Approver.__new__(Approver)
+    approver.ui = {"policy": "canned", "text": "Proceed."}
+
+    assert approver._question_answer({"type": "boolean"}) is True
+    assert Manifest({"default": "deny"}).decide({"type": "proc.run"})[0] == "deny"
+
+
+def test_the_viewer_returns_only_new_events_and_survives_a_partial_line(tmp_path: Path) -> None:
+    """Re-reading a multi-megabyte event log at 1 Hz is the viewer's whole cost.
+
+    The partial-line case is not hypothetical: the file is being appended to
+    while it is read, so the last line is routinely half-written.
+    """
+    run = tmp_path / "run"
+    (run / "tasks" / "a").mkdir(parents=True)
+    (run / "run.json").write_text(json.dumps({"run_id": "r", "tasks": ["a"]}), encoding="utf-8")
+    (run / "tasks" / "a" / "status.json").write_text(
+        json.dumps({"task_id": "a", "state": "running"}), encoding="utf-8")
+    events = run / "tasks" / "a" / "events.jsonl"
+    events.write_text(json.dumps({"at": 1, "frame": {"kind": "typing", "payload": True}}) + "\n",
+                      encoding="utf-8")
+
+    first = load_state(run, "a", 0)
+    assert len(first["events"]) == 1 and first["cursor"] > 0
+    assert load_state(run, "a", first["cursor"])["events"] == []
+
+    with events.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"at": 2, "frame": {"kind": "typing", "payload": False}}) + "\n")
+        handle.write('{"at": 3, "frame": {"kind": "str')      # writer mid-flush
+    second = load_state(run, "a", first["cursor"])
+    assert len(second["events"]) == 1                          # partial withheld
+    with events.open("a", encoding="utf-8") as handle:
+        handle.write('eam_delta"}}\n')
+    assert len(load_state(run, "a", second["cursor"])["events"]) == 1   # then whole
+
+
+def test_the_viewer_follows_the_running_task_until_a_task_is_clicked(tmp_path: Path) -> None:
+    """It used to latch onto whatever ran when the page opened and stay there."""
+    run = tmp_path / "run"
+    for task_id, state in (("a", "complete"), ("b", "running")):
+        folder = run / "tasks" / task_id
+        folder.mkdir(parents=True)
+        (folder / "status.json").write_text(
+            json.dumps({"task_id": task_id, "state": state, "outcome_score": 1.0}), encoding="utf-8")
+    (run / "run.json").write_text(json.dumps({"run_id": "r", "tasks": ["a", "b"]}), encoding="utf-8")
+
+    assert load_state(run, "a", 0, follow=True)["selected"] == "b"
+    assert load_state(run, "a", 0, follow=False)["selected"] == "a"
+    assert load_state(run, "a", 99, follow=True)["cursor"] == 0      # reset on switch
+
+
+def test_a_dead_task_explains_itself_in_the_viewer(tmp_path: Path) -> None:
+    """A frozen task with a ticking clock reads as healthy. The log says otherwise."""
+    run = tmp_path / "run"
+    (run / "tasks" / "a").mkdir(parents=True)
+    (run / "run.json").write_text(json.dumps({"run_id": "r", "tasks": ["a"]}), encoding="utf-8")
+    (run / "tasks" / "a" / "harness.log").write_text("container exited 137\n", encoding="utf-8")
+
+    assert "container exited 137" in load_state(run, "a", 0)["logs"]["harness.log"]
+
+
+def test_several_writers_share_the_live_log_without_shredding_a_line(tmp_path: Path, monkeypatch) -> None:
+    """O_APPEND is atomic only below PIPE_BUF, and payloads exceed it.
+
+    An interleaved line fails ``json.loads`` and is skipped by every reader,
+    so the event disappears with no error anywhere.
+    """
+    monkeypatch.setenv("SB_LIVE_EVENT_LOG", str(tmp_path / "events.jsonl"))
+    live.reset()
+    log = live.shared()
+
+    def spam(tag: str) -> None:
+        for index in range(120):
+            log.write(tag, "decision", payload={"blob": tag * 400, "index": index})
+
+    threads = [threading.Thread(target=spam, args=(tag,)) for tag in ("approver", "llm")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    log.close()
+
+    lines = (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 240
+    assert all(json.loads(line)["kind"] == "decision" for line in lines)

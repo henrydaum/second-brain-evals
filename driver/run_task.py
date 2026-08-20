@@ -115,6 +115,13 @@ def main(argv=None):
         "stream": client.stream_state,
         "security_mode": requested_mode,
         "setup_approvals": setup_approver.decisions,
+        # ``/mode yolo`` is gated by ``ModeCommand.approval_actions`` and its
+        # dialog carries no ``detail``, so it arrives as a *question* rather
+        # than a permission gate and lands in ``setup_approver.questions``.
+        # That is the only record that the requested mode was actually
+        # granted, so it has to be in the bundle -- a run whose mode silently
+        # failed to take is a run measuring the wrong configuration.
+        "setup_questions": setup_approver.questions,
         "template": _template_manifest(),
         "model": {"model": os.environ.get("SB_LLM_MODEL"),
                   "endpoint": os.environ.get("SB_LLM_ENDPOINT"),
