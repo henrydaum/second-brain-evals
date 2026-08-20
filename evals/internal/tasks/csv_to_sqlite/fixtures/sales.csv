@@ -1,0 +1,7 @@
+order_id,region,quantity,unit_price
+1001,north,3,4.50
+1002,south,10,2.25
+1003,north,1,19.99
+1004,east,7,3.00
+1005,west,2,12.50
+1006,south,5,8.20

@@ -21,6 +21,14 @@ RUN pip install --no-cache-dir litellm Pillow
 # pristine writable copy without rebuilding the image.
 COPY template/ /opt/sb-template/
 
+# The shared driver, baked so a trial needs no mount and no copy step. It is
+# standard-library only by rule -- the same files are copied into Harbor's and
+# Boundary-Bench's task containers, where a pip install is either unavailable
+# or a cost paid once per trial. Nested one level deeper than it looks so that
+# /opt/sb-driver is the *parent* of the package: `driver.wire` then imports
+# under its own name here and in a checkout alike.
+COPY driver/ /opt/sb-driver/driver/
+
 # Any user must be able to own a DATA_DIR: benchmarks run unprivileged, and
 # Boundary-Bench's hardening drops privileges outright.
 RUN mkdir -p /data && chmod 777 /data

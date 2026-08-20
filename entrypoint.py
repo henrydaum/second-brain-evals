@@ -69,8 +69,20 @@ def configure() -> None:
     # Deliverables live outside DATA_DIR: a benchmark hands the agent a task
     # directory and reads what it leaves there. Without this the agent can
     # write only its own workspace and every task write raises a dialog.
+    #
+    # The directories are *created*, because listing one that does not exist
+    # grants nothing: the agent's first deliverable write fails, and in a
+    # benchmark that reads as the model failing the task rather than as the
+    # harness never having made the folder. Best-effort -- an unwritable
+    # parent is the run's problem to report, not this function's to raise on.
     if extra := os.environ.get("SB_WRITABLE_DIRS"):
-        config["fs_writable_dirs"] = [p for p in extra.split(",") if p.strip()]
+        writable = [p for p in extra.split(",") if p.strip()]
+        config["fs_writable_dirs"] = writable
+        for path in writable:
+            try:
+                Path(path).mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                print(f"[entrypoint] could not create {path}: {e}", flush=True)
 
     config_manager.save(config)
     print(f"[entrypoint] services={config.get('autoload_services')} "

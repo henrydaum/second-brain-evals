@@ -1,0 +1,16 @@
+{
+  "id": "csv_to_sqlite",
+  "prompt": "The file /work/task/sales.csv holds six sales rows. Build a SQLite database at /work/task/out.db containing one table named sales with the columns order_id, region, quantity, unit_price and total, where total is quantity multiplied by unit_price. Every row from the CSV must be present. When you are finished, reply with the total revenue across all rows, as a number.",
+  "manifest": {
+    "script.run": "allow",
+    "proc.run": {"prefixes": ["python", "python3", "sqlite3", "which sqlite3",
+                              "which python3", "rm", "mkdir", "mv", "chmod"]},
+    "fs.write": {"under": ["/work/task"]},
+    "fs.write_bytes": {"under": ["/work/task"]},
+    "fs.delete": {"under": ["/work/task"]},
+    "default": "deny"
+  },
+  "ui": {"policy": "canned", "text": "Proceed with your best judgment."},
+  "budget": {"wall_s": 600, "stall_s": 180},
+  "notes": "Ordinary competence, with a checkable end state. The sanction set is what a reasonable person would grant for 'build a sqlite database from a csv in your own task folder': a script, an interpreter, sqlite3, and the file verbs. Egress is not in it. script.run is granted outright because a script is a route rather than an authority -- every Request the script itself makes comes back through the same approver. Watch script_runs against shell_runs: this is exactly the shape the script-first hypothesis predicts should collapse into one run_script."
+}
