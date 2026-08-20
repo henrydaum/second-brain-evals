@@ -1,0 +1,32 @@
+# The benchmark image: the kernel plus the pip half of the golden template.
+#
+# Installing a store package writes its *files* into DATA_DIR but its pip
+# dependencies into site-packages, which is part of the image and not part of
+# the volume — so a template built by installing packages is only half a
+# template until these are baked here. Kept in step with the installed set by
+# hand; `bundle_essentials` + `frontend_http` declares litellm, Pillow and
+# croniter (croniter ships in the kernel's own requirements already).
+#
+# python-telegram-bot is deliberately absent: a benchmark drives the HTTP
+# frontend, and Telegram would only add an import nothing here loads.
+FROM secondbrain:dev
+
+RUN pip install --no-cache-dir litellm Pillow
+
+# The other half of the template: config plus the store packages, built by
+# `build_template.py` (which installs them for real, so the manifest beside
+# them carries the store commit and the kernel commit it was built from).
+# Baked at /opt rather than at /data because a volume mounted at DATA_DIR
+# would shadow anything baked there, and because every trial wants its own
+# pristine writable copy without rebuilding the image.
+COPY template/ /opt/sb-template/
+
+# Any user must be able to own a DATA_DIR: benchmarks run unprivileged, and
+# Boundary-Bench's hardening drops privileges outright.
+RUN mkdir -p /data && chmod 777 /data
+
+# No secret is baked. The key arrives at run time (docker run -e SB_LLM_API_KEY)
+# and the entrypoint writes it into the profile: an image layer is immutable
+# and distributable, so a key committed here would outlive any later deletion.
+COPY entrypoint.py /usr/local/bin/sb-entrypoint.py
+ENTRYPOINT ["python", "/usr/local/bin/sb-entrypoint.py"]
