@@ -363,12 +363,46 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const $ = id => document.getElementById(id);
 const SAVED = {
+  // -- headline ------------------------------------------------------
   'config_scores': 'SELECT * FROM config_scores',
   'task_reliability': 'SELECT * FROM task_reliability ORDER BY mean_score',
   'trials': 'SELECT trial_id, task_id, difficulty, profile, mode, score, elapsed_sec,\n       input_tokens_billed, output_tokens, cost_total_usd, validity_flags\nFROM trials ORDER BY trial_id',
-  'cost by profile': 'SELECT profile, COUNT(*) AS trials, ROUND(AVG(score),4) AS score,\n       SUM(input_tokens_billed) AS input_tokens, SUM(output_tokens) AS output_tokens,\n       ROUND(SUM(cost_total_usd),4) AS cost_usd\nFROM trials GROUP BY profile',
-  'failed checks': 'SELECT * FROM failed_checks LIMIT 200',
+
+  // -- where the money goes ------------------------------------------
+  // Caching makes input nearly free, so cost follows what the model WRITES.
+  // Output has been ~7% of tokens and ~46% of spend.
+  'cost split': "SELECT SUM(input_tokens_billed) AS input_tokens,\n       SUM(cached_input_tokens) AS cached_tokens,\n       ROUND(100.0*SUM(cached_input_tokens)/SUM(input_tokens_billed)) AS pct_cached,\n       SUM(output_tokens) AS output_tokens,\n       ROUND(SUM(cost_input_usd),4) AS input_usd,\n       ROUND(SUM(cost_output_usd),4) AS output_usd,\n       ROUND(100.0*SUM(cost_output_usd)/(SUM(cost_input_usd)+SUM(cost_output_usd))) AS output_pct_of_spend\nFROM trials WHERE tokens_complete = 1",
+  'most expensive trials': "SELECT task_id, score, output_tokens, input_tokens_billed,\n       ROUND(cost_total_usd,4) AS usd, tool_calls, model_calls\nFROM trials WHERE tokens_complete = 1 ORDER BY cost_total_usd DESC LIMIT 25",
+  'cost per point': "SELECT task_id, ROUND(AVG(score),3) AS score,\n       ROUND(AVG(cost_total_usd),5) AS usd,\n       ROUND(AVG(cost_total_usd)/NULLIF(AVG(score),0),5) AS usd_per_point\nFROM trials WHERE tokens_complete = 1 GROUP BY task_id ORDER BY usd_per_point DESC",
+
+  // -- systematic vs stochastic failure ------------------------------
+  // The key split. A task that scores the SAME every time has a capability
+  // gap: read one transcript, repeats teach nothing. A task whose score
+  // SWINGS is a reliability problem: the agent can do it and sometimes
+  // does not, and that is a different fix.
+  'systematic vs stochastic': "SELECT task_id, COUNT(*) AS runs,\n       ROUND(MIN(score),3) AS worst, ROUND(MAX(score),3) AS best,\n       ROUND(MAX(score)-MIN(score),3) AS spread,\n       CASE WHEN MAX(score)-MIN(score) < 0.02 THEN 'systematic'\n            ELSE 'stochastic' END AS kind,\n       MIN(tool_calls) AS min_tools, MAX(tool_calls) AS max_tools\nFROM trials WHERE state = 'complete'\nGROUP BY task_id HAVING runs > 1 ORDER BY spread DESC",
+  'never solved': "SELECT task_id, COUNT(*) AS runs, ROUND(AVG(score),3) AS mean_score\nFROM trials WHERE state = 'complete'\nGROUP BY task_id HAVING MAX(score) < 0.999 ORDER BY mean_score",
+
+  // -- wasted effort --------------------------------------------------
+  // A repeated exact action is the same tool with byte-identical arguments.
+  // Observed: validate called nine times on one unchanged path, eight of
+  // them after it had already passed, for the same score a run using no
+  // validate at all achieved.
+  'repeated actions': "SELECT task_id, trial_id, tool_calls, repeated_exact_actions AS repeats,\n       ROUND(100.0*repeated_exact_actions/NULLIF(tool_calls,0)) AS pct_wasted,\n       score, output_tokens\nFROM trials WHERE repeated_exact_actions > 0 ORDER BY repeats DESC",
+  'the repeat loop': "SELECT t.task_id, c.tool_name, COUNT(*) AS calls,\n       SUM(c.is_repeated_exact_action) AS exact_repeats,\n       SUM(CASE WHEN c.ok = 0 THEN 1 ELSE 0 END) AS failed\nFROM tool_calls c JOIN trials t USING (trial_id)\nGROUP BY t.task_id, c.tool_name\nHAVING exact_repeats > 0 ORDER BY exact_repeats DESC LIMIT 40",
+  'tool error rates': "SELECT tool_name, COUNT(*) AS calls,\n       SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS failed,\n       ROUND(100.0*SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END)/COUNT(*),1) AS pct_failed,\n       ROUND(AVG(duration_s),2) AS avg_sec\nFROM tool_calls GROUP BY tool_name ORDER BY pct_failed DESC",
+  'effort vs reward': "SELECT task_id, ROUND(AVG(tool_calls),1) AS tools,\n       ROUND(AVG(output_tokens)) AS output, ROUND(AVG(score),3) AS score,\n       ROUND(AVG(elapsed_sec)) AS secs\nFROM trials WHERE state = 'complete'\nGROUP BY task_id ORDER BY tools DESC",
+
+  // -- discipline -----------------------------------------------------
+  // Modifying a fixture the task said to leave alone. Not a capability
+  // gap; the agent simply wrote where it should not have.
+  'integrity failures': "SELECT task_id, trial_id, score, input_integrity, validity_flags\nFROM trials WHERE input_integrity = 'fail'",
+  'flagged trials': "SELECT task_id, trial_id, score, validity_flags\nFROM trials WHERE validity_flags <> '' ORDER BY validity_flags",
+
+  // -- reading one trial ----------------------------------------------
+  'failed checks': "SELECT task_id, check_id, weight, substr(detail_json,1,160) AS detail\nFROM failed_checks ORDER BY task_id, weight DESC LIMIT 200",
   'transcript': "SELECT trial_id, round, message_index, role, substr(content,1,200) AS content\nFROM messages ORDER BY trial_id, round, message_index LIMIT 300",
+  'what it said last': "SELECT trial_id, round, substr(final_text,1,400) AS final_text\nFROM driver_rounds ORDER BY trial_id, round LIMIT 60",
   'tables': "SELECT name, type FROM sqlite_master WHERE type IN ('table','view') ORDER BY type, name",
 };
 $('saved').innerHTML = Object.keys(SAVED).map(k =>

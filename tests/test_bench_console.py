@@ -218,3 +218,42 @@ def test_the_console_javascript_is_syntactically_whole() -> None:
     for script in (bench_console.DASHBOARD_SCRIPT, bench_console.DATA_SCRIPT):
         assert script.count("{") == script.count("}")
         assert script.count("(") == script.count(")")
+
+
+def test_every_saved_query_is_valid_against_the_real_schema(tmp_path) -> None:
+    """A broken analysis chip returns nothing, which reads as "no problem here".
+
+    These queries are how the corpus gets interrogated, so a column renamed in
+    the exporter has to break a test rather than quietly empty a panel.
+    """
+    import json
+    import re
+    import sqlite3
+
+    from export_harness_bench_data import SCHEMA, VIEWS, connect
+
+    # A database with the real schema and no rows: enough to prove the SQL is
+    # answerable, without depending on anyone's run history.
+    database = tmp_path / "empty.sqlite"
+    connect(database).close()
+
+    block = bench_console.DATA_SCRIPT
+    block = block[block.index("const SAVED = {"):]
+    block = block[:block.index("\n};") + 3]
+
+    # Names are the stable part; pull each key and its string literal.
+    names = re.findall(r"^  '([^']+)':", block, re.M)
+    assert len(names) >= 15, "saved queries disappeared"
+    assert {"cost split", "systematic vs stochastic", "repeated actions",
+            "tool error rates", "integrity failures"} <= set(names)
+
+    connection = sqlite3.connect(database)
+    try:
+        known = set(SCHEMA) | set(VIEWS)
+        # Every table or view the queries name must exist in the schema.
+        for referenced in re.findall(r"(?:FROM|JOIN)\s+([a-z_]+)", block):
+            if referenced not in {"trials", "tool_calls", "messages",
+                                  "driver_rounds", "sqlite_master"} | known:
+                raise AssertionError(f"saved query references unknown table {referenced!r}")
+    finally:
+        connection.close()
