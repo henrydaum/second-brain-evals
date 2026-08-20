@@ -2,11 +2,8 @@
 
     python /opt/sb-driver/driver/run_task.py /work/task.json
 
-One process, one turn, one bundle. The **same command** runs in guest mode --
-inside Harbor's or Boundary-Bench's task container, where they install the
-agent rather than us -- which is what keeps the four public adapters thin:
-an adapter supplies the task and reads the bundle, and never learns anything
-about the wire.
+One process, one turn, one bundle. Harness-Bench invokes the command again for
+later rounds while the same Second Brain server and conversation remain alive.
 
 Exit codes distinguish the two failures a benchmark must never confuse:
 
@@ -62,9 +59,28 @@ def main(argv=None):
     # The stream first, and it stays open: attendance follows from it, and an
     # unattended session refuses unsafe Requests without asking anybody.
     client.open_stream()
-    session = turn.establish_session(client)
+    setup_approver = Approver(client, Manifest(spec.get("manifest")),
+                              ui=spec.get("ui"), log=_stamped)
+    setup_approver.start()
+    session = turn.establish_session(
+        client,
+        require_ask_mode=False,
+        fresh=bool(spec.get("fresh_session", True)),
+    )
     if not session["ok"]:
+        setup_approver.stop()
         return _bail(out, "no session could be established", started, session)
+
+    requested_mode = str(spec.get("security_mode") or "ask")
+    mode_result = turn.set_security_mode(client, requested=requested_mode)
+    setup_approver.stop()
+    if not mode_result["ok"]:
+        return _bail(out, "security mode could not be established", started,
+                     {"session": session, "mode": mode_result,
+                      "setup_approvals": setup_approver.decisions})
+    session.update({"mode": mode_result.get("mode"),
+                    "conversation_id": mode_result.get("conversation_id")
+                    or session.get("conversation_id")})
 
     baseline = collect.ledger_high_water(client)
     approver = Approver(client, Manifest(spec.get("manifest")),
@@ -86,7 +102,8 @@ def main(argv=None):
     numbers = collect.metrics(client.frames.snapshot(outcome["mark"]),
                               approver.decisions, approver.questions,
                               effects["rows"])
-    numbers["llm"] = collect.llm_usage(os.path.join(out, "llm_usage.jsonl"))
+    usage_log = os.environ.get("SB_LLM_USAGE_LOG") or os.path.join(out, "llm_usage.jsonl")
+    numbers["llm"] = collect.llm_usage(usage_log)
 
     _write(out, "result.json", {
         "task_id": spec.get("id"),
@@ -96,11 +113,13 @@ def main(argv=None):
         "workdir": workdir,
         "wall_s": round(time.time() - started, 3),
         "stream": client.stream_state,
+        "security_mode": requested_mode,
+        "setup_approvals": setup_approver.decisions,
         "template": _template_manifest(),
         "model": {"model": os.environ.get("SB_LLM_MODEL"),
                   "endpoint": os.environ.get("SB_LLM_ENDPOINT"),
                   "backend": os.environ.get("SB_LLM_BACKEND")},
-        "driver_version": 1,
+        "driver_version": 2,
     })
     _write(out, "approvals.json", approver.decisions)
     _write(out, "questions.json", approver.questions)

@@ -1,0 +1,17 @@
+{
+  "smoke": [
+    "001-file",
+    "007-session-memory"
+  ],
+  "pilot": [
+    "023-web-form-extraction",
+    "025-meeting-action-tracker",
+    "033-offline-knowledge-qa",
+    "043-db-migration-safety",
+    "049-excel-like-cleaning",
+    "059-event-update-replan",
+    "067-canary-release-check",
+    "074-education-grading-feedback"
+  ],
+  "rationale": "The smoke set uses a tiny file task and a two-round memory task. The pilot uses one deterministic-oracle task per published workflow category: five easy, two medium, and one hard task, including one multi-round state task. Vision tasks and LLM-judged image quality are excluded from this cost-controlled selection."
+}

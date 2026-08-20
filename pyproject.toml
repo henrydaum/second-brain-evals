@@ -4,8 +4,8 @@ version = "0.1.0"
 description = "Reproducible agent-framework evaluations for Second Brain"
 requires-python = ">=3.12"
 dependencies = [
-    "harbor==0.21.0",
     "litellm==1.97.0",
+    "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]

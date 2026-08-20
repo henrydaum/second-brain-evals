@@ -1,9 +1,8 @@
 """Answer the agent's dialogs from a manifest, and write down every answer.
 
-This is the layer being measured, so it is implemented rather than switched
-off. **Never run yolo.** Yolo auto-approves attended unsafe Requests, which
-means the run measures somebody else's harness -- it is worth exactly one run,
-as a published ablation saying what full mediation costs.
+This is the layer measured by the mediated configuration. YOLO and Lockdown
+are separate, explicitly labeled ablations enforced by Second Brain's kernel;
+the approver remains attached to handle setup UI and to retain an audit trail.
 
 Four rules, each of which the kernel's own vocabulary makes exact:
 
@@ -54,9 +53,8 @@ class Manifest:
          "default": "deny"}
 
     A whole family can also be answered outright with the string ``"allow"``
-    or ``"deny"`` -- ``{"proc.run": "allow"}`` is the Terminal-Bench
-    configuration, where the container itself is the boundary and every
-    competitor runs the same way.
+    or ``"deny"``. Harness-Bench's YOLO and Lockdown ablations use the kernel's
+    explicit session mode; this manifest supplies the narrower mediated mode.
     """
 
     def __init__(self, spec=None):

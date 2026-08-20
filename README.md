@@ -1,46 +1,37 @@
 # Second Brain Evals
 
-This repository measures **Second Brain as an agent framework**. The first
-supported benchmark is Terminal-Bench 2, run by its official Harbor harness.
-Harbor owns the task container and verifier; Second Brain is installed into
-that same container, works on the real task filesystem, and is scored from the
-filesystem state it leaves behind.
+This repository measures Second Brain as an agent framework. Its first supported
+benchmark is the pinned 106-task Harness-Bench release. Each task runs in a fresh
+container, but every round of a multi-round task reconnects to the same Second
+Brain session. This prevents memory leakage between trials without discarding the
+state a task deliberately asks the agent to retain.
 
-That boundary matters. A Second Brain sidecar can appear healthy while all of
-its commands affect the wrong container, producing a meaningless score of
-zero. The custom Harbor agent in `evals/terminal_bench/agent.py` avoids that.
-
-## Architecture
-
-```text
-Harbor job
-  -> one fresh Terminal-Bench task container per trial
-     -> upload pinned Second Brain payload
-     -> create an isolated Python environment
-     -> seed a pristine Second Brain data tree
-     -> expose Harbor's task workdir as Second Brain's project root
-     -> submit the instruction through Second Brain's HTTP frontend
-     -> automatically answer sandbox approvals and retain the audit trail
-     -> Harbor runs the task's own verifier
-```
-
-The generated payload records the Second Brain kernel commit, store commit,
-installed profile, runtime dependencies, and the small project-root adaptation
-used by benchmark containers. No API key is copied into it.
+The default metric is **deterministic completion**: the mean official oracle
+score across every scheduled task, with failed or missing trials counted as zero.
+The costly LLM process grader and image-quality judge are deliberately disabled.
+This makes the pilot affordable and repeatable, but it is not the paper's full
+combined score and must be labeled accordingly.
 
 ## Setup
 
-Requirements: Docker Desktop with Linux containers, Python 3.12+, and a
-Second Brain checkout next to this repository (or `SECOND_BRAIN_REPO` pointing
-to it).
+Requirements are Docker Desktop using Linux containers, Python 3.12+, the
+general-purpose `second-brain:latest` image, and a Second Brain checkout next to
+this repository (or `SECOND_BRAIN_REPO` set to its location).
 
 ```powershell
 py -3.13 -m venv .venv
-.venv\Scripts\python -m pip install -e .
+.venv\Scripts\python -m pip install -e ".[dev]"
 python build_template.py --profile bench
+python run_harness_bench.py --fetch-benchmark --validate
+python run_harness_bench.py --build-image --self-test
 ```
 
-`bench.env` is ignored by git and must contain:
+The upstream benchmark is checked out under the ignored `build` directory and
+must be exactly the revision recorded in
+`evals/harness_bench/benchmark.lock.json`. That revision has no repository
+license, so its source is not vendored here.
+
+Create an ignored `bench.env`:
 
 ```dotenv
 SB_LLM_API_KEY=...
@@ -50,90 +41,74 @@ SB_LLM_BACKEND=LiteLLMService
 SB_HTTP_TOKEN=a-local-random-token
 ```
 
-Optional benchmark knobs are `SB_TASK_TIMEOUT` (default 900 seconds),
-`SB_STALL_TIMEOUT` (300), `SB_TOOL_CALL_LIMIT` (100), and `SB_LLM_CONTEXT`.
-The launcher makes a one-token provider preflight before scheduling Docker
-tasks, so an expired key, exhausted quota, or bad endpoint cannot silently
-turn into a benchmark score. `--skip-provider-check` exists for offline/debug
-work but should not be used for a reported run.
+## Run safely
 
-Every trial records model-call count and provider-reported input prompt tokens
-in `agent/llm_usage.jsonl` and the Second Brain result bundle. Completion-token
-usage is not currently exposed by the kernel event, so it remains explicitly
-unknown rather than being estimated or treated as zero.
-
-## Run Terminal-Bench
-
-Start with one verifier-scored task:
+Validation and self-tests make no model calls:
 
 ```powershell
-python run_terminal_bench.py `
-  --smoke terminal-bench/break-filter-js-from-html `
-  --job-name second-brain-smoke
+python run_harness_bench.py --validate
+python run_harness_bench.py --self-test
 ```
 
-Then run the complete 89-task Terminal-Bench 2 dataset:
+Paid execution always requires the explicit `--execute` switch. Begin with one
+task, not the smoke set:
 
 ```powershell
-python run_terminal_bench.py --full --attempts 1 --concurrency 2
+python run_harness_bench.py --task 001-file --mode yolo --execute --run-id minimax-integration
 ```
 
-The complete job does **not** need to finish in one sitting. Press Ctrl+C to
-pause it; completed task results stay in the Harbor job directory. Later, once
-the provider preflight succeeds again, resume the same job with:
+After that integration task is reliable, run the two-task smoke or the
+category-stratified eight-task pilot:
 
 ```powershell
-python run_terminal_bench.py `
-  --resume results\harbor\<job-name> `
-  --env-file bench.env
+python run_harness_bench.py --smoke --mode yolo --execute --run-id minimax-smoke
+python run_harness_bench.py --pilot --mode yolo --execute --run-id minimax-pilot
 ```
 
-If the provider returns a quota, authentication, or credit error during a
-trial, the adapter marks that trial `ProviderUnavailableError` and signals the
-launcher to pause the entire job before more tasks are scheduled. On resume,
-that invalid trial and any Ctrl+C-cancelled trials restart in fresh containers;
-valid completed trials are not repeated. Resume also refuses to mix different
-Second Brain payload versions in one reported score.
-
-One attempt is a useful engineering score. Use `--attempts 5` for a more
-stable comparison or submission-quality run. Results and every task's verifier
-output are written under `results/harbor/<job-name>/`.
-
-### Watch a run in the Harbor Viewer
-
-Harbor includes a local web UI for its job directories. In a second terminal,
-from this repository, run:
+The launcher performs a one-token provider preflight, stops before scheduling
+another task when it detects quota or credit exhaustion, and writes each task as
+it finishes. Resume the same configuration later without rerunning successes:
 
 ```powershell
-.venv\Scripts\harbor view results\harbor --jobs --port 8080
+python run_harness_bench.py --smoke --mode yolo --execute `
+  --resume results\harness-bench\minimax-smoke
 ```
 
-Then open <http://127.0.0.1:8080>. The job page updates its completion count,
-aggregate reward, and errors while the benchmark runs. Finished trials expose
-the full recorded trajectory, agent logs, changed files, and verifier output.
-The current Second Brain adapter downloads a trial's detailed event bundle at
-the end of that trial, so refresh the page as tasks finish; active trials are
-listed immediately but do not yet stream individual tool events to the UI.
+Add `--retry-failed` only when failed tasks should be attempted again. A run may
+span multiple quota windows; it does not need to complete in one sitting.
 
-The reported score is Harbor's mean reward across **all scheduled trials**.
-Agent or harness exceptions are not silently dropped; inspect the exception
-count beside the mean and the per-trial `result.json` files.
+## Watch the agent
 
-## Terminus 2 comparison
+Start the viewer in a second terminal after a run directory has been created:
 
-[Terminus 2](https://www.harborframework.com/docs/agents/terminus-2) is the
-right reference target: it is Harbor's autonomous reference agent and uses the
-same task/verifier protocol. Compare it on the same dataset version, task
-selection, model endpoint, attempts, concurrency, and timeouts. Its mono-tool
-tmux design differs from Second Brain's mediated multi-tool sandbox, which is
-exactly the agent-framework difference this repository aims to measure.
+```powershell
+python view_harness_bench.py --run latest
+```
 
-## What the result does and does not measure
+The local UI at <http://127.0.0.1:8765> updates once per second and shows model
+text, tool activity, approvals, errors, model-call count, known prompt tokens,
+task state, and oracle scores. The underlying JSONL trace, official result,
+sandbox, and logs remain in `results/harness-bench/<run-id>/tasks/<task-id>/`.
 
-Terminal-Bench measures whether an autonomous framework can leave a difficult
-terminal environment in a verifier-approved state. It captures orchestration,
-tool use, recovery, context management, and model/framework interaction. It
-does not directly measure Second Brain's long-lived database, embedding,
-self-evolution, or human-in-the-loop safety advantages. Those need separate
-datasets and metrics later; they are deliberately out of scope until this
-Terminal-Bench path is stable.
+## Security modes
+
+- `yolo` asks Second Brain to auto-approve tool operations.
+- `lockdown` denies tool operations at the kernel security boundary.
+- `mediated` uses an explicit benchmark policy that permits workspace file work
+  and Second Brain's scripting tool while retaining mediation elsewhere.
+
+Use identical task selections, model configuration, timeouts, and benchmark
+revision when comparing modes or frameworks. MiniMax M3 is useful for cheap
+harness engineering, but a publishable framework comparison also needs the same
+established model run through Second Brain and a reference harness.
+
+Compare two completed or interrupted runs with compatibility checks and paired
+task deltas:
+
+```powershell
+python compare_harness_runs.py minimax-yolo minimax-lockdown `
+  --output results\harness-bench\yolo-vs-lockdown.json
+```
+
+See [docs/HARNESS_BENCH.md](docs/HARNESS_BENCH.md) for architecture, artifacts,
+scoring caveats, and troubleshooting.

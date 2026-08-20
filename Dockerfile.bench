@@ -1,40 +1,37 @@
-# The benchmark image: the kernel plus the pip half of the golden template.
+# Harness-Bench runtime derived from Second Brain's general-purpose image.
 #
-# Installing a store package writes its *files* into DATA_DIR but its pip
-# dependencies into site-packages, which is part of the image and not part of
-# the volume — so a template built by installing packages is only half a
-# template until these are baked here. Kept in step with the installed set by
-# hand; `bundle_essentials` + `frontend_http` declares litellm, Pillow and
-# croniter (croniter ships in the kernel's own requirements already).
-#
-# python-telegram-bot is deliberately absent: a benchmark drives the HTTP
-# frontend, and Telegram would only add an import nothing here loads.
-FROM secondbrain:dev
+# The application image stays general. This layer only adds a reproducible
+# data-tree seed, the benchmark driver, and Harness-Bench's tiny Python
+# dependency. Harness-Bench itself is supplied from a pinned checkout at run
+# time because its upstream repository currently has no code license.
+ARG SB_BASE_IMAGE=second-brain:latest
+FROM ${SB_BASE_IMAGE}
 
-RUN pip install --no-cache-dir litellm Pillow
+USER root
 
-# The other half of the template: config plus the store packages, built by
-# `build_template.py` (which installs them for real, so the manifest beside
-# them carries the store commit and the kernel commit it was built from).
-# Baked at /opt rather than at /data because a volume mounted at DATA_DIR
-# would shadow anything baked there, and because every trial wants its own
-# pristine writable copy without rebuilding the image.
-COPY template/ /opt/sb-template/
+# Store package files live in the seed, while their import dependencies belong
+# to the image. PyYAML is the only dependency declared by Harness-Bench.
+RUN PIP_USER=0 pip install --no-cache-dir --no-user \
+        litellm==1.97.0 Pillow "PyYAML>=6.0"
 
-# The shared driver, baked so a trial needs no mount and no copy step. It is
-# standard-library only by rule -- the same files are copied into Harbor's and
-# Boundary-Bench's task containers, where a pip install is either unavailable
-# or a cost paid once per trial. Nested one level deeper than it looks so that
-# /opt/sb-driver is the *parent* of the package: `driver.wire` then imports
-# under its own name here and in a checkout alike.
-COPY driver/ /opt/sb-driver/driver/
+COPY --chown=1000:1000 ["template/Second Brain/", "/seed/"]
+COPY --chown=1000:1000 template/template_manifest.json /seed/template_manifest.json
+COPY --chown=1000:1000 driver/ /opt/sb-driver/driver/
+COPY --chown=1000:1000 harness/eval_telemetry.py /opt/sb-evals/eval_telemetry.py
+COPY --chown=1000:1000 entrypoint.py /opt/sb-evals/entrypoint.py
+COPY --chown=1000:1000 evals/harness_bench/drive_round.py /opt/sb-evals/drive_round.py
 
-# Any user must be able to own a DATA_DIR: benchmarks run unprivileged, and
-# Boundary-Bench's hardening drops privileges outright.
-RUN mkdir -p /data && chmod 777 /data
+RUN mkdir -p /work/live /work/harnessbench \
+    && chown -R 1000:1000 /work /opt/sb-driver /opt/sb-evals /seed
 
-# No secret is baked. The key arrives at run time (docker run -e SB_LLM_API_KEY)
-# and the entrypoint writes it into the profile: an image layer is immutable
-# and distributable, so a key committed here would outlive any later deletion.
-COPY entrypoint.py /usr/local/bin/sb-entrypoint.py
-ENTRYPOINT ["python", "/usr/local/bin/sb-entrypoint.py"]
+USER 1000:1000
+
+ENV SB_SEED_DIR=/seed \
+    SB_TEMPLATE_MANIFEST=/seed/template_manifest.json \
+    SB_LLM_USAGE_LOG=/work/live/llm_usage.jsonl \
+    SB_LIVE_EVENT_LOG=/work/live/events.jsonl
+
+# The base entrypoint performs the normal seed operation before executing this
+# command. The wrapper writes run-only secrets into that copied data tree and
+# starts the unmodified application.
+CMD ["python", "/opt/sb-evals/entrypoint.py"]

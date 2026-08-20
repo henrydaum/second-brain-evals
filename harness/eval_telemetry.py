@@ -28,6 +28,7 @@ def install() -> None:
     from events.event_channels import AGENT_LLM_CALL_FINISHED
 
     path = Path(target)
+    live_target = os.environ.get("SB_LIVE_EVENT_LOG")
 
     def record(payload) -> None:
         row = dict(payload or {})
@@ -37,5 +38,11 @@ def install() -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(rendered + "\n")
+            if live_target:
+                live_path = Path(live_target)
+                live_path.parent.mkdir(parents=True, exist_ok=True)
+                event = {"at": time.time(), "source": "llm", "kind": "llm_call", "payload": row}
+                with live_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
 
     _unsubscribe = bus.subscribe(AGENT_LLM_CALL_FINISHED, record)

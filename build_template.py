@@ -28,7 +28,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 DOCKER = os.environ.get(
     "SB_DOCKER", r"C:\Program Files\Docker\Docker\resources\bin\docker.exe")
-BASE_IMAGE = "second-brain:eval-base"
+BASE_IMAGE = "second-brain:latest"
 
 #: What each profile installs. A benchmark's reported configuration is this
 #: list plus the two commits below it, and nothing else.
@@ -136,9 +136,8 @@ def main() -> int:
         print("template build failed", file=sys.stderr)
         return result.returncode
 
-
-    # Runtime packages are installed once per Harbor environment for that
-    # environment's Python.  Keeping Linux 3.13 site-packages here would make
+    # Runtime packages are installed in the derived benchmark image. Keeping
+    # Linux 3.13 site-packages here would make
     # the supposedly portable seed interpreter-specific.
     shutil.rmtree(staging / "python", ignore_errors=True)
     if out.exists():
@@ -150,8 +149,7 @@ def main() -> int:
         print("\n" + manifest.read_text(encoding="utf-8"))
     files = sum(1 for _ in (out / "Second Brain" / "installed").rglob("*.py"))
     print(f"installed python files: {files}")
-    print("\nNow: python run_terminal_bench.py --smoke "
-          "terminal-bench/openssl-selfsigned-cert")
+    print("\nNow: python run_harness_bench.py --build-image")
     return 0
 
 

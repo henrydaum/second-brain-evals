@@ -28,7 +28,7 @@ BLOCKED_PHASES = ("filling_command_form", "approving_request")
 
 
 def establish_session(client, command=BOOTSTRAP_COMMAND, seconds=90.0,
-                      require_ask_mode=True):
+                      require_ask_mode=True, fresh=True):
     """Make a session exist and leave it ready to take a turn.
 
     **Not optional, and the single most expensive omission available.** A
@@ -51,8 +51,11 @@ def establish_session(client, command=BOOTSTRAP_COMMAND, seconds=90.0,
     instantly, which reads as a model that answered in 1.8 seconds.
     """
     mark = client.frames.mark()
-    status, answer = client.post(
-        "frontend.submit", {"input_kind": "text", "text": command})
+    existing = (client.post("session.get", {"details": True})[1].get("data")) or {}
+    status, answer = 200, {"data": existing}
+    if fresh or not existing:
+        status, answer = client.post(
+            "frontend.submit", {"input_kind": "text", "text": command})
     deadline = time.time() + seconds
     data = {}
     while time.time() < deadline:
@@ -72,8 +75,8 @@ def establish_session(client, command=BOOTSTRAP_COMMAND, seconds=90.0,
 
     mode = data.get("mode")
     ready = data.get("phase") == "awaiting_input"
-    # A run in yolo measures somebody else's harness: it auto-approves the
-    # attended unsafe Requests that are the whole point of the measurement.
+    # Callers may require ask mode for a mediated run or deliberately request
+    # a kernel-enforced YOLO/Lockdown ablation after session establishment.
     honest = (mode == "ask") or not require_ask_mode
     return {"ok": bool(ready and honest),
             "phase": data.get("phase"),
@@ -82,6 +85,34 @@ def establish_session(client, command=BOOTSTRAP_COMMAND, seconds=90.0,
             "submit_status": status, "submit_answer": answer,
             "attended": bool(data.get("attended")),
             "note": None if honest else "refusing to run in mode " + str(mode)}
+
+
+def set_security_mode(client, requested="ask", seconds=90.0):
+    """Move the attended session into the explicitly requested kernel mode."""
+    if requested not in ("ask", "yolo", "lockdown"):
+        return {"ok": False, "mode": None, "note": "unknown mode " + repr(requested)}
+    data = (client.post("session.get", {"details": True})[1].get("data")) or {}
+    if data.get("mode") == requested and data.get("phase") == "awaiting_input":
+        return {"ok": True, "mode": requested, "phase": data.get("phase"),
+                "conversation_id": data.get("conversation_id"), "changed": False}
+
+    mark = client.frames.mark()
+    status, answer = client.post(
+        "frontend.submit", {"input_kind": "text", "text": "/mode " + requested})
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        data = (client.post("session.get", {"details": True})[1].get("data")) or {}
+        if (data.get("phase") == "awaiting_input"
+                and data.get("mode") == requested
+                and not _still_typing(client, mark)):
+            return {"ok": True, "mode": requested, "phase": data.get("phase"),
+                    "conversation_id": data.get("conversation_id"), "changed": True,
+                    "submit_status": status, "submit_answer": answer}
+        time.sleep(0.25)
+    return {"ok": False, "mode": data.get("mode"), "phase": data.get("phase"),
+            "conversation_id": data.get("conversation_id"), "changed": True,
+            "submit_status": status, "submit_answer": answer,
+            "note": "mode transition did not settle"}
 
 
 def run_turn(client, prompt, wall_s=900.0, stall_s=300.0, approver=None,
