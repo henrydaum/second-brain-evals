@@ -150,6 +150,171 @@ network before drawing any conclusion from the mean. A suite-wide average over
 a task set that is mostly file manipulation will report a small delta for a
 reason that has nothing to do with how good the security system is.
 
+## Jobs: configuration in, data out
+
+A **job** is a configuration — model, plugin profile, permission mode, task
+selection, and a repeat count. Running one produces **trials**, one per task
+per replicate, each joined back to the configuration that produced it.
+
+```python
+from harness_bench_api import HarnessBenchAPI, JobSpec
+
+api = HarnessBenchAPI()
+job = api.plan(JobSpec(model="minimax/MiniMax-M3",
+                       tasks={"difficulty": ["easy"]},
+                       profile="bench", mode="yolo", repeats=3))
+api.run(job.job_id)      # resumable
+api.dataset()            # every run on disk -> SQLite
+```
+
+The same surface as a CLI, JSON on stdout:
+
+```
+python harness_bench_api.py new --model minimax/MiniMax-M3 --difficulty easy --repeats 3
+python harness_bench_api.py run <job-id>
+python harness_bench_api.py status <job-id>
+python harness_bench_api.py export
+```
+
+`plan` spends nothing: it resolves the selection, writes
+`results/harness-bench/jobs/<job_id>/job.json`, and stops. Only `run` starts
+containers, and only with `--execute` (the default; `--dry-run` withholds it).
+
+### A replicate is an ordinary run
+
+Replicate *n* of job `J` is the run directory `J-r{n}`, in the layout that
+already existed. That is why `--resume`, `view_harness_bench.py`,
+`compare_harness_runs.py` and the exporter all work on it unchanged, and why
+`trial_id` stays `run_id/task_id`.
+
+The job file records which runs belong together. It never becomes a second
+account of what happened: **trial state is always derived from the run
+directories**, so `status` reads the same files the launcher wrote and there is
+nothing to keep in sync.
+
+### Pausing is the normal path
+
+The 106-task suite will not fit in one sitting against a rate-limited
+provider, so stopping is designed for rather than recovered from. The launcher
+exits 75 on provider exhaustion and 130 on Ctrl+C; both leave the run
+directory resumable. `run()` catches them, marks the job `paused` with the
+reason, and returns — no exception, no partial-state cleanup. Calling `run()`
+again resumes: finished replicates are skipped entirely, and an existing run
+directory is continued with `--resume`, which carries the launcher's conflict
+guard so a resumed job can never silently mix two configurations.
+
+### Task selection
+
+Difficulty is taken verbatim from each `task.yaml`, and it is **not** a tidy
+three-bucket scheme. At the pinned revision:
+
+| Difficulty | Tasks |
+|---|---|
+| `hard` | 42 |
+| `medium` | 30 |
+| `unspecified` | 24 |
+| `easy` | 7 |
+| `medium-hard` | 3 |
+
+A selection written as "easy, medium, hard" covers 79 of 106 while looking
+exhaustive. Selectors accept `ids`, `difficulty`, `class`, `all`, `pilot`,
+`smoke`, and `exclude`; an unknown value raises rather than matching nothing,
+because a typo that selects zero tasks produces a run that looks finished.
+
+## Plugin profiles
+
+Which store packages the agent has is a variable, not a constant, and
+`profiles.json` holds it in two layers:
+
+- **`seed`** — what `build_template.py` bakes into the image, by really
+  installing from `origin/store` so the template carries its own provenance.
+- **`runtime`** — the delta `entrypoint.py` applies when a container starts.
+  This is what a job names, and it needs no rebuild.
+
+```
+--profile bench         the seed as built
+--profile no-script     drops run_script and validate
+--profile no-subagents  drops spawn/schedule_subagent
+--profile lean          file and shell work only
+```
+
+Comparing plugin sets therefore costs a container start rather than two image
+builds, which is what makes the comparison worth running.
+
+**A failed install or removal kills the container**, and the task is recorded
+as a harness error. The alternative — continuing with the seed's plugin set
+while the job's manifest claims otherwise — produces a trial whose
+configuration column is wrong, and that quietly corrupts every comparison
+drawn from it afterwards.
+
+After applying the delta the entrypoint writes `live/profile.json`: the tools
+actually on disk, not the ones requested. That distinction is the point. A
+removal naming a stem the seed never had would otherwise be reported as
+applied, and the exporter raises `profile_mismatch` in `validity_flags` when
+the effective profile disagrees with the requested one.
+
+`run.json`'s `visible_tools` is now **derived** from the template manifest and
+the profile delta. It used to be a module constant, which was harmless only
+while every run had the same plugin set — precisely the assumption `--profile`
+exists to break.
+
+## Tokens and cost
+
+All three token counts are the **provider's own**, lifted from the `usage`
+block of its response. Nothing is tokenised anywhere in this stack: only the
+provider knows how it serialised the chat template and the tool schemas, so its
+number is the billable one and a local estimate would be a second opinion
+nobody charges by. On the streaming path
+`stream_options={"include_usage": True}` asks for a final chunk carrying the
+same block; a provider that ignores it leaves the counts `None`.
+
+| Column | Meaning |
+|---|---|
+| `input_tokens_billed` | Σ of each call's whole prompt. **Billed input, not context size** — each call re-sends the conversation, so this climbs across a turn. |
+| `input_tokens_largest_call` | The biggest single prompt. *This* is the context-size question. |
+| `cached_input_tokens` | The discounted **share of** billed input, never an addition to it. |
+| `output_tokens` | Completion tokens. |
+| `tokens_complete` | Whether every call reported both input and output. |
+
+**Unknown is never zero.** A count the provider withheld stays `NULL`, and a
+`NULL` price yields a `NULL` cost rather than a free-looking run. Prices live
+in `models.json` and cost is computed at *export* time, so correcting a price
+and re-exporting fixes every trial already on disk.
+
+Output and cached counts require kernel commit `<TBD>` or later — before that
+the kernel published only `prompt_tokens`. `kernel_commit` is on every trial
+row, so old and new trials are separable rather than silently averaged.
+
+## The database
+
+`results/harness-bench/harness_bench.sqlite`, rebuilt from run directories:
+
+| Table | Holds |
+|---|---|
+| `jobs` | one row per job configuration |
+| `runs` | one row per replicate, with kernel/store/benchmark commits |
+| `trials` | one row per task per replicate: score, tokens, cost, timings |
+| `messages` | the conversation transcript, per round |
+| `driver_rounds` | per-round driver metrics and the *granted* security mode |
+| `model_calls`, `tool_calls`, `approvals`, `oracle_checks` | the detail |
+| `events` | raw event rows, only with `--with-events` |
+| `source_runs` | fingerprints, so unchanged runs are skipped |
+
+Run directories are the source of truth and the database is derived, so
+re-exporting is always safe: a changed run has its rows deleted and rewritten,
+never appended beside the old ones. A whole-corpus export also prunes runs and
+jobs that are no longer on disk; a narrowed `--run` export never prunes.
+
+Two views carry the headline numbers:
+
+- **`task_reliability`** — per configuration per task: `trials`, `mean_score`,
+  `min`/`max`, `pass_rate`. This is what repeats exist to produce.
+- **`config_scores`** — the benchmark number, computed as
+  **mean over tasks( mean over replicates )**. Averaging trials flat would let
+  a task that happened to be repeated three times outweigh one run once, so the
+  score would drift with the scheduling history rather than with the harness.
+  Since the suite is run in pieces as usage allows, that history is arbitrary.
+
 ## Result artifacts
 
 Each run contains:
@@ -160,8 +325,11 @@ Each run contains:
 - `tasks/<id>/events.jsonl`: viewer-ready live event stream (see below);
 - `tasks/<id>/official-results/`: official Harness-Bench result JSON;
 - `tasks/<id>/sandboxes/`: final task workspace and per-round driver outputs;
-- `tasks/<id>/harness.log` and `container.log`: diagnostic output; and
-- `tasks/<id>/live/`: the container-side telemetry copy.
+- `tasks/<id>/harness.log` and `container.log`: diagnostic output;
+- `tasks/<id>/live/llm_usage.jsonl`: one row per model call, with the
+  provider's own token counts; and
+- `tasks/<id>/live/profile.json`: the plugin set the container **actually**
+  ran, written by the entrypoint after applying the job's profile delta.
 
 Each attempt **replaces** the previous attempt's `official-results/`,
 `sandboxes/` and `live/` rather than merging into it. `docker cp` nests its

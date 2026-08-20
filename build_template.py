@@ -30,28 +30,20 @@ DOCKER = os.environ.get(
     "SB_DOCKER", r"C:\Program Files\Docker\Docker\resources\bin\docker.exe")
 BASE_IMAGE = "second-brain:latest"
 
-#: What each profile installs. A benchmark's reported configuration is this
-#: list plus the two commits below it, and nothing else.
-PROFILES = {
-    "bench": {
-        "packages": ["bundle_essentials", "frontend_http"],
-        # Interactive surfaces have no user on the other side during an eval.
-        # Install the published bundle first, then remove only these members so
-        # the benchmark remains "Essentials minus interactive-only pieces".
-        "exclude_packages": [
-            "frontend_telegram", "tool_ask_question", "tool_show_files",
-        ],
-        # A service is not loaded because it is installed. These are the
-        # *registered* names (a class's ``name``), not file stems.
-        "autoload_services": ["web_search_provider"],
-    },
-    "minimal": {
-        "packages": ["llm_litellm", "frontend_http", "tool_read_file",
-                     "tool_edit_file", "tool_run_command", "tool_run_script"],
-        "autoload_services": [],
-        "exclude_packages": [],
-    },
-}
+#: What each profile installs, read from ``profiles.json`` so the benchmark's
+#: plugin configuration lives in data rather than in this file. A run's
+#: reported configuration is the seed profile plus the runtime delta the
+#: entrypoint applies, plus the two commits recorded in the manifest.
+#:
+#: Interactive surfaces have no user on the other side during an eval, so the
+#: ``bench`` profile installs the published bundle and then removes only those
+#: members -- it stays "Essentials minus interactive-only pieces" rather than
+#: becoming a hand-listed set that drifts from the bundle.
+#:
+#: ``autoload_services`` are *registered* names (a class's ``name``), not file
+#: stems: a service is not loaded merely because it is installed.
+PROFILES = json.loads(
+    (HERE / "profiles.json").read_text(encoding="utf-8"))["seed"]
 
 # Runs inside the container, where the kernel is importable and the store is
 # reachable. Kept as a string so the builder stays one file.
@@ -90,8 +82,28 @@ commit = subprocess.run(["git", "-C", "/app", "rev-parse", "origin/store"],
                         capture_output=True, text=True).stdout.strip()
 head = subprocess.run(["git", "-C", "/app", "rev-parse", "HEAD"],
                       capture_output=True, text=True).stdout.strip()
+
+# What is *actually* on disk after the installs and exclusions, rather than
+# what we asked for. A bundle's membership can change under us, and a run that
+# reports a hand-maintained tool list is a run whose published configuration is
+# a guess. Everything downstream reads these two lists.
+import os
+installed_files = []
+root = "/data/Second Brain/installed"
+for folder, _, names in os.walk(root):
+    for name in sorted(names):
+        if name.endswith(".py") and not name.startswith("__"):
+            installed_files.append(
+                os.path.relpath(os.path.join(folder, name), root).replace(os.sep, "/"))
+installed_files.sort()
+tool_names = sorted(
+    os.path.basename(path)[len("tool_"):-len(".py")]
+    for path in installed_files
+    if os.path.basename(path).startswith("tool_"))
+
 manifest = {"packages": installed, "excluded_packages": exclusions,
             "autoload_services": services,
+            "installed_files": installed_files, "tool_names": tool_names,
             "store_commit": commit, "kernel_commit": head,
             "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 open("/data/template_manifest.json", "w").write(json.dumps(manifest, indent=2))

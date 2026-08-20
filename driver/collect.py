@@ -222,9 +222,23 @@ def metrics(frames, decisions, questions, ledger_rows):
 def llm_usage(path):
     """Summarize benchmark telemetry emitted by the kernel's LLM event bus.
 
-    Second Brain currently exposes provider-reported prompt tokens but not
-    completion tokens on this event.  Unknown token counts remain explicit;
-    they are never treated as zero.
+    All three token counts are the provider's own, taken from the ``usage``
+    block of its response. Nothing is tokenised here or anywhere upstream.
+
+    Two properties this function exists to preserve:
+
+    * **Unknown is never zero.** A provider that returns no usage block leaves
+      the count ``None``, and the total stays ``None`` rather than silently
+      summing to a smaller number. ``*_complete`` says whether every call
+      answered, so a partial record can be excluded from a cost average
+      instead of quietly deflating it.
+    * **Input is billed, not resident.** Each call re-sends the whole
+      conversation, so ``input_tokens_billed`` climbs across a turn and its
+      sum is what the invoice is based on -- *not* the context size. The
+      largest single call is reported separately for that question.
+
+    ``cached_input_tokens`` is the discounted share *of* the billed input, so
+    a cost calculation splits the input total rather than adding to it.
     """
     rows = []
     try:
@@ -239,15 +253,32 @@ def llm_usage(path):
     except OSError:
         pass
 
-    known = [int(row["prompt_tokens"]) for row in rows
-             if isinstance(row.get("prompt_tokens"), (int, float))]
+    def counts(field):
+        return [int(row[field]) for row in rows
+                if isinstance(row.get(field), (int, float))
+                and not isinstance(row.get(field), bool)]
+
+    billed = counts("prompt_tokens")
+    cached = counts("cached_prompt_tokens")
+    output = counts("completion_tokens")
     durations = [float(row["duration_s"]) for row in rows
                  if isinstance(row.get("duration_s"), (int, float))]
     return {
         "calls": len(rows),
         "successful_calls": sum(1 for row in rows if row.get("ok") is True),
         "failed_calls": sum(1 for row in rows if row.get("ok") is False),
-        "calls_with_prompt_tokens": len(known),
-        "prompt_tokens_total_known": sum(known) if known else None,
+        "calls_with_prompt_tokens": len(billed),
+        "calls_with_completion_tokens": len(output),
+        "input_tokens_billed": sum(billed) if billed else None,
+        "input_tokens_largest_call": max(billed) if billed else None,
+        "cached_input_tokens": sum(cached) if cached else None,
+        "output_tokens": sum(output) if output else None,
+        # True only when every call answered with that count, which is the
+        # precondition for treating the total as a complete measurement.
+        "input_complete": bool(rows) and len(billed) == len(rows),
+        "output_complete": bool(rows) and len(output) == len(rows),
         "duration_s_total": round(sum(durations), 3),
+        # Retained under its old name so bundles written by either driver
+        # version stay readable by one exporter.
+        "prompt_tokens_total_known": sum(billed) if billed else None,
     }

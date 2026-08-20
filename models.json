@@ -1,0 +1,36 @@
+{
+  "$comment": [
+    "One description per model: how to reach it, and what it costs.",
+    "",
+    "The API key never lives here -- it stays in the env file. This file is",
+    "safe to commit and to publish beside a score, which is the point: a",
+    "benchmark number is meaningless without the price basis it was computed",
+    "against.",
+    "",
+    "Prices are USD per million tokens. 'cached_input_usd_per_mtok' is the",
+    "discounted rate for the cached SHARE of input, not an extra charge on",
+    "top -- the exporter splits the input total, it does not add to it. Null",
+    "means the provider publishes no cached rate, and the exporter then bills",
+    "cached tokens at the full input rate rather than inventing a discount.",
+    "",
+    "A null price yields a null cost column, never a zero and never a guess.",
+    "Costs are computed at export time, so correcting a price here and",
+    "re-exporting fixes every trial already on disk retroactively."
+  ],
+  "pricing_version": "2026-08-20",
+  "models": {
+    "minimax/MiniMax-M3": {
+      "endpoint": "https://api.minimax.io/v1",
+      "backend": "LiteLLMService",
+      "context_size": 0,
+      "pricing": {
+        "input_usd_per_mtok": 0.30,
+        "cached_input_usd_per_mtok": null,
+        "_output_note": "UNVERIFIED: carried over from no published source. Fill this in from MiniMax's price page before publishing any cost figure; until it is set, output cost and total cost export as NULL.",
+        "output_usd_per_mtok": null
+      },
+      "pricing_as_of": "2026-08-20",
+      "pricing_source": "TODO: url of the price page this was read from"
+    }
+  }
+}

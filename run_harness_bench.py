@@ -32,9 +32,24 @@ ROOT = Path(__file__).resolve().parent
 EVAL_DIR = ROOT / "evals" / "harness_bench"
 LOCK = json.loads((EVAL_DIR / "benchmark.lock.json").read_text(encoding="utf-8"))
 SELECTIONS = json.loads((EVAL_DIR / "pilot.json").read_text(encoding="utf-8"))
+#: Plugin sets a job can ask for. ``seed`` is baked into the image by
+#: ``build_template.py``; ``runtime`` is the delta ``entrypoint.py`` applies
+#: when the container starts. A job names a ``runtime`` profile.
+PROFILES = json.loads((ROOT / "profiles.json").read_text(encoding="utf-8"))["runtime"]
+#: Endpoint, backend and pricing per model, so ``--model`` is enough to switch
+#: providers and so cost can be computed later from the same source of truth.
+MODELS = json.loads((ROOT / "models.json").read_text(encoding="utf-8"))["models"]
 DEFAULT_BENCHMARK = ROOT / "build" / "harness-bench-src"
 DEFAULT_IMAGE = "second-brain:harness-bench"
 RESULTS = ROOT / "results" / "harness-bench"
+#: The tool set the **default ``bench`` profile** is expected to expose, used
+#: by ``--self-test`` to prove the profile actually took effect.
+#:
+#: This is a pin, not a description of a run. Every other consumer derives the
+#: tool list from the template manifest and the job's profile delta, because a
+#: run under ``--profile no-script`` legitimately has fewer tools and a
+#: constant would quietly misreport it. Only the self-test may compare against
+#: this, and only because the self-test always runs the default profile.
 BENCHMARK_TOOLS = {
     "edit_file", "glob", "grep", "read_file", "run_command", "run_script",
     "schedule_subagent", "spawn_subagent", "sql_query", "validate", "web_search",
@@ -71,7 +86,15 @@ def main(argv: list[str] | None = None) -> int:
     selection.add_argument("--smoke", action="store_true", help="two-task file + multi-round session smoke")
     selection.add_argument("--pilot", action="store_true", help="eight-task category-stratified pilot")
     selection.add_argument("--task", action="append", help="exact task id; repeatable")
+    selection.add_argument("--all", action="store_true", help="every task at the pinned revision")
+    parser.add_argument("--difficulty", action="append",
+                        help="easy|medium|medium-hard|hard|unsorted; repeatable, combines with --task-class")
+    parser.add_argument("--task-class", action="append", help="published category; repeatable")
+    parser.add_argument("--exclude", action="append", help="task id to drop from the selection; repeatable")
     parser.add_argument("--mode", choices=("yolo", "lockdown", "mediated"), default="yolo")
+    parser.add_argument("--profile", default="bench", choices=sorted(PROFILES),
+                        help="plugin set, applied at container start (see profiles.json)")
+    parser.add_argument("--model", help="model id from models.json; overrides SB_LLM_MODEL")
     parser.add_argument("--benchmark-root", default=str(DEFAULT_BENCHMARK))
     parser.add_argument("--fetch-benchmark", action="store_true", help="clone/fetch the exact pinned upstream revision")
     parser.add_argument("--env-file", default="bench.env")
@@ -115,19 +138,41 @@ def main(argv: list[str] | None = None) -> int:
     if not env_file.is_file():
         parser.error(f"env file does not exist: {env_file}")
     env_values = read_env(env_file)
-    model = env_values.get("SB_LLM_MODEL")
+    # ``--model`` names an entry in models.json, whose endpoint and backend
+    # then override the env file. The API key stays in the env file: it is the
+    # one setting that must not live in a committed, publishable description.
+    model = options.model or env_values.get("SB_LLM_MODEL")
     if not model:
-        parser.error("SB_LLM_MODEL is missing from the env file")
+        parser.error("no model: pass --model or set SB_LLM_MODEL in the env file")
+    if options.model and options.model not in MODELS:
+        parser.error(f"unknown model {options.model!r}; models.json knows: "
+                     + ", ".join(sorted(MODELS)))
+    spec = MODELS.get(model) or {}
+    env_overrides = {
+        "SB_LLM_MODEL": model,
+        "SB_LLM_ENDPOINT": spec.get("endpoint") or env_values.get("SB_LLM_ENDPOINT", ""),
+        "SB_LLM_BACKEND": spec.get("backend") or env_values.get("SB_LLM_BACKEND", ""),
+        "SB_PROFILE": options.profile,
+        "SB_ADD_PACKAGES": ",".join(PROFILES[options.profile].get("add") or []),
+        "SB_REMOVE_PACKAGES": ",".join(PROFILES[options.profile].get("remove") or []),
+    }
+    if spec.get("context_size"):
+        env_overrides["SB_LLM_CONTEXT"] = str(spec["context_size"])
+    # Preflight has to test the endpoint the containers will actually use, not
+    # whatever the env file happened to name.
+    preflight_values = dict(env_values)
+    preflight_values.update({k: v for k, v in env_overrides.items() if v})
     if not options.skip_provider_check:
         try:
-            provider_preflight(model, env_values)
+            provider_preflight(model, preflight_values)
         except ProviderUnavailableError as exc:
             print(f"Provider unavailable; no benchmark task started: {exc}", file=sys.stderr)
             return 75
 
     image_id = inspect_image(options.image)
     run_dir, run = open_run(options, tasks, model, metadata, image_id)
-    print(f"Harness-Bench run {run['run_id']}: {len(tasks)} tasks, {options.mode}, Essentials tools, {model}")
+    print(f"Harness-Bench run {run['run_id']}: {len(tasks)} tasks, "
+          f"{options.mode}, profile {options.profile}, {model}")
     print(f"Results: {run_dir}")
     write_json(run_dir / "run.json", run)
 
@@ -152,6 +197,7 @@ def main(argv: list[str] | None = None) -> int:
                 model=model,
                 keep_container=options.keep_container,
                 position=f"{index}/{len(tasks)}",
+                env_overrides=env_overrides,
             )
         except KeyboardInterrupt:
             # A *second* Ctrl+C, landing while the first one's cleanup was
@@ -255,11 +301,49 @@ def fetch_benchmark(root: Path) -> None:
 
 
 def choose_tasks(options: argparse.Namespace, available: dict[str, Any]) -> list[str]:
-    chosen = options.task or (SELECTIONS["pilot"] if options.pilot else SELECTIONS["smoke"])
+    """Resolve a task selection from ids, difficulty, class, or the whole suite.
+
+    Difficulty is taken verbatim from each ``task.yaml`` and is **not** a tidy
+    three-bucket scheme. At the pinned revision the values are ``hard`` (42),
+    ``medium`` (30), ``unspecified`` (24, the tasks that declare no difficulty
+    at all), ``easy`` (7) and ``medium-hard`` (3) -- so a filter for "not hard"
+    that forgets ``medium-hard`` silently drops three tasks, and one for "easy
+    plus medium" quietly covers 37 of 106. Unknown filter values raise rather
+    than matching nothing, because a typo that yields an empty run looks
+    exactly like a finished one.
+    """
+    chosen = list(options.task or [])
+    filtered = bool(options.difficulty or options.task_class)
+    if filtered:
+        wanted_difficulty = set(options.difficulty or [])
+        wanted_class = set(options.task_class or [])
+        known_difficulty = {row["difficulty"] for row in available.values()}
+        known_class = {row["class"] for row in available.values()}
+        for label, wanted, known in (("difficulty", wanted_difficulty, known_difficulty),
+                                     ("class", wanted_class, known_class)):
+            unknown = sorted(wanted - known)
+            if unknown:
+                raise RuntimeError(
+                    f"unknown {label}: {', '.join(unknown)}. "
+                    f"Known values: {', '.join(sorted(known))}")
+        chosen += [
+            task_id for task_id, row in sorted(available.items())
+            if (not wanted_difficulty or row["difficulty"] in wanted_difficulty)
+            and (not wanted_class or row["class"] in wanted_class)
+        ]
+    elif options.all:
+        chosen += sorted(available)
+    elif not chosen:
+        chosen = list(SELECTIONS["pilot"] if options.pilot else SELECTIONS["smoke"])
+
     unknown = [task for task in chosen if task not in available]
     if unknown:
         raise RuntimeError("unknown Harness-Bench task(s): " + ", ".join(unknown))
-    return list(dict.fromkeys(chosen))
+    excluded = set(options.exclude or [])
+    resolved = [task for task in dict.fromkeys(chosen) if task not in excluded]
+    if not resolved:
+        raise RuntimeError("task selection resolved to nothing")
+    return resolved
 
 
 def build_image(image: str) -> None:
@@ -384,7 +468,7 @@ def open_run(options, tasks, model, metadata, image_id):
         run = read_json(run_dir / "run.json")
         if not run:
             raise RuntimeError(f"resume metadata is missing: {run_dir / 'run.json'}")
-        expected = {"mode": options.mode, "model": model,
+        expected = {"mode": options.mode, "model": model, "profile": options.profile,
                     "benchmark_commit": metadata["commit"], "image_id": image_id}
         conflicts = {key: (run.get(key), value) for key, value in expected.items() if run.get(key) != value}
         if conflicts:
@@ -399,15 +483,33 @@ def open_run(options, tasks, model, metadata, image_id):
     if (run_dir / "run.json").exists():
         raise RuntimeError(f"run already exists; use --resume {run_dir}")
     run_dir.mkdir(parents=True, exist_ok=True)
-    template = read_json(ROOT / "template" / "template_manifest.json")
+    template = read_json(ROOT / "template" / "template_manifest.json") or {}
+    profile = PROFILES[options.profile]
+    # **Derived, never asserted.** ``visible_tools`` used to be a module
+    # constant, which was harmless only while the plugin set never changed.
+    # The moment a job varies plugins -- the reason this file grew a
+    # ``--profile`` flag -- a hardcoded list makes every run.json claim a tool
+    # set it did not have. The seed's real contents come from the template
+    # manifest; the per-task ground truth is ``live/profile.json``, written by
+    # the entrypoint after the delta is applied.
+    seed_tools = set(template.get("tool_names") or [])
+    expected_tools = sorted(
+        (seed_tools | {stem.removeprefix("tool_") for stem in profile.get("add") or []})
+        - {stem.removeprefix("tool_") for stem in profile.get("remove") or []}
+    ) if seed_tools else None
     run = {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": run_id,
         "created_at": time.time(),
         "mode": options.mode,
         "model": model,
-        "tool_profile": "bundle_essentials minus telegram, ask_question, show_files",
-        "visible_tools": sorted(BENCHMARK_TOOLS),
+        "model_spec": MODELS.get(model),
+        "profile": options.profile,
+        "profile_spec": profile,
+        "tool_profile": profile.get("description") or options.profile,
+        # ``None`` when the template predates ``tool_names`` -- absent rather
+        # than guessed, so nobody reads a stale constant as measurement.
+        "visible_tools": expected_tools,
         "tasks": tasks,
         "task_metadata": {task_id: metadata["tasks"][task_id] for task_id in tasks},
         "benchmark_repository": metadata["repository"],
@@ -424,10 +526,12 @@ def open_run(options, tasks, model, metadata, image_id):
 
 
 def run_one_task(*, task_id, task_dir, benchmark, env_file, image, mode, model,
-                 keep_container, position):
+                 keep_container, position, env_overrides=None):
     task_dir.mkdir(parents=True, exist_ok=True)
     write_json(task_dir / "problem.json", snapshot_problem(benchmark, task_id))
-    status = {"task_id": task_id, "state": "running", "started_at": time.time(), "mode": mode, "model": model}
+    status = {"task_id": task_id, "state": "running", "started_at": time.time(),
+              "mode": mode, "model": model,
+              "profile": (env_overrides or {}).get("SB_PROFILE")}
     write_json(task_dir / "status.json", status)
     container = safe_container_name(f"sb-hb-{task_id}-{uuid.uuid4().hex[:6]}")
     tail = None
@@ -437,7 +541,7 @@ def run_one_task(*, task_id, task_dir, benchmark, env_file, image, mode, model,
         with tempfile.TemporaryDirectory(prefix="sb-harnessbench-") as temp:
             stage = Path(temp) / "harnessbench"
             stage_benchmark(benchmark, stage, task_id, mode, model)
-            run_container(container, image, env_file)
+            run_container(container, image, env_file, env_overrides)
             copy_into(container, stage, "/work/harnessbench")
             protect_benchmark_assets(container)
             tail, event_thread = stream_events(container, task_dir / "events.jsonl")
@@ -595,12 +699,26 @@ def task_timeout(source: Path, task_id: str) -> int:
     return int(manifest.get("timeout_sec") or 600)
 
 
-def run_container(name: str, image: str, env_file: Path) -> None:
-    result = docker(
+def run_container(name: str, image: str, env_file: Path,
+                  overrides: dict[str, str] | None = None) -> None:
+    """Start one task's server, with the job's configuration layered on top.
+
+    ``--env-file`` supplies the standing settings and the API key; ``-e`` wins
+    over it, which is what lets a job choose a model and a plugin profile
+    without editing the file on disk or building an image per combination.
+    """
+    arguments = [
         "run", "-d", "--name", name, "--init", "--env-file", str(env_file),
         "-e", "SB_WRITABLE_DIRS=/work/harnessbench",
-        "-e", "PYTHONUTF8=1", "-e", "PYTHONIOENCODING=utf-8", image,
-    )
+        "-e", "PYTHONUTF8=1", "-e", "PYTHONIOENCODING=utf-8",
+    ]
+    for key, value in (overrides or {}).items():
+        # An empty override would otherwise *unset* the env-file value, which
+        # is never what "the job did not specify this" should mean.
+        if value not in (None, ""):
+            arguments.extend(("-e", f"{key}={value}"))
+    arguments.append(image)
+    result = docker(*arguments)
     if result.returncode:
         raise RuntimeError(result.stderr or result.stdout or "docker run failed")
 
@@ -733,8 +851,10 @@ def summarize(run_dir: Path, task_ids: list[str]) -> dict[str, Any]:
     scores: list[float] = []
     unscored = 0
     llm_calls = 0
-    prompt_tokens = 0
-    calls_with_tokens = 0
+    # Provider-reported counts, kept per bucket with their own call tallies so
+    # a total is only ever published beside how many calls actually answered.
+    token_totals = {"input": 0, "cached": 0, "output": 0}
+    token_calls = {"input": 0, "cached": 0, "output": 0}
     for task_id in task_ids:
         status = read_json(run_dir / "tasks" / task_id / "status.json") or {"task_id": task_id, "state": "pending"}
         rows.append(status)
@@ -755,10 +875,14 @@ def summarize(run_dir: Path, task_ids: list[str]) -> dict[str, Any]:
             if event.get("source") != "llm" or event.get("kind") != "llm_call":
                 continue
             llm_calls += 1
-            tokens = (event.get("payload") or {}).get("prompt_tokens")
-            if isinstance(tokens, (int, float)):
-                prompt_tokens += int(tokens)
-                calls_with_tokens += 1
+            payload = event.get("payload") or {}
+            for field, bucket in (("prompt_tokens", "input"),
+                                  ("cached_prompt_tokens", "cached"),
+                                  ("completion_tokens", "output")):
+                value = payload.get(field)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    token_totals[bucket] += int(value)
+                    token_calls[bucket] += 1
     return {
         "run_id": run_dir.name,
         "task_count": len(task_ids),
@@ -768,11 +892,19 @@ def summarize(run_dir: Path, task_ids: list[str]) -> dict[str, Any]:
         "completion_score": round(statistics.mean(scores), 6) if scores else None,
         "score_denominator": len(task_ids),
         "completed_without_oracle_score": unscored,
+        # ``input_tokens_billed`` is the sum of each call's whole prompt --
+        # what the provider charges for -- and not the context size. A total
+        # stays ``None`` when no call reported it, because a missing count
+        # read as zero understates cost without ever looking wrong.
         "llm_usage": {
             "calls": llm_calls,
-            "calls_with_prompt_tokens": calls_with_tokens,
-            "prompt_tokens_total_known": prompt_tokens if calls_with_tokens else None,
-            "completion_tokens": None,
+            "calls_with_prompt_tokens": token_calls["input"],
+            "calls_with_completion_tokens": token_calls["output"],
+            "input_tokens_billed": token_totals["input"] if token_calls["input"] else None,
+            "cached_input_tokens": token_totals["cached"] if token_calls["cached"] else None,
+            "output_tokens": token_totals["output"] if token_calls["output"] else None,
+            "input_complete": bool(llm_calls) and token_calls["input"] == llm_calls,
+            "output_complete": bool(llm_calls) and token_calls["output"] == llm_calls,
         },
         "tasks": rows,
         "updated_at": time.time(),

@@ -1,0 +1,57 @@
+{
+  "$comment": [
+    "Plugin configuration for benchmark jobs, in two layers.",
+    "",
+    "'seed' profiles are baked into the image by build_template.py: a real",
+    "package_manager install from origin/store, so the template carries its own",
+    "provenance rather than a claim about it. Changing one means rebuilding.",
+    "",
+    "'runtime' profiles are deltas the entrypoint applies to that seed when a",
+    "container starts. They are what a job names, and they need no rebuild --",
+    "which is the point, because comparing plugin sets is the experiment.",
+    "",
+    "A runtime profile's 'remove' list is the interesting direction: the seed",
+    "carries everything, and a profile asks what the agent can do without."
+  ],
+  "seed": {
+    "bench": {
+      "packages": ["bundle_essentials", "frontend_http"],
+      "exclude_packages": ["frontend_telegram", "tool_ask_question", "tool_show_files"],
+      "autoload_services": ["web_search_provider"]
+    },
+    "minimal": {
+      "packages": ["llm_litellm", "frontend_http", "tool_read_file",
+                   "tool_edit_file", "tool_run_command", "tool_run_script"],
+      "exclude_packages": [],
+      "autoload_services": []
+    }
+  },
+  "runtime": {
+    "bench": {
+      "description": "The seed as built: Essentials minus interactive-only pieces.",
+      "add": [],
+      "remove": []
+    },
+    "no-script": {
+      "description": "Drops run_script and validate. Tests the hypothesis that the script-and-verify pair costs more tokens than it earns once no approval dialog can refuse a shell command anyway.",
+      "add": [],
+      "remove": ["tool_run_script", "tool_validate"]
+    },
+    "no-validate": {
+      "description": "Keeps run_script, drops validate alone, to separate the cost of scripting from the cost of checking.",
+      "add": [],
+      "remove": ["tool_validate"]
+    },
+    "no-subagents": {
+      "description": "Drops delegation. Isolates whether subagent spawning helps or merely multiplies context.",
+      "add": [],
+      "remove": ["tool_spawn_subagent", "tool_schedule_subagent"]
+    },
+    "lean": {
+      "description": "File and shell work only: no scripting, no delegation, no search tools.",
+      "add": [],
+      "remove": ["tool_run_script", "tool_validate", "tool_spawn_subagent",
+                 "tool_schedule_subagent", "tool_web_search", "tool_sql_query"]
+    }
+  }
+}

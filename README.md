@@ -142,35 +142,79 @@ python compare_harness_runs.py minimax-yolo minimax-lockdown `
 See [docs/HARNESS_BENCH.md](docs/HARNESS_BENCH.md) for architecture, artifacts,
 scoring caveats, and troubleshooting.
 
-## Programmatic API and analysis data
+## Jobs: configuration in, data out
 
-Run tasks from Python and receive the run summary, normalized trial rows, and
-SQLite dataset path:
+A **job** is a configuration — model, plugin profile, permission mode, task
+selection, repeat count. Running one produces **trials**, one per task per
+replicate, each joined back to the configuration that produced it.
 
 ```python
-from harness_bench_api import HarnessBenchAPI, RunRequest
+from harness_bench_api import HarnessBenchAPI, JobSpec
 
-result = HarnessBenchAPI().run_tasks(RunRequest(
-    task_ids=["034-evidence-matrix-claims"], mode="yolo",
-))
-print(result.summary)
-print(result.database)
+api = HarnessBenchAPI()
+job = api.plan(JobSpec(model="minimax/MiniMax-M3",
+                       tasks={"difficulty": ["easy"]},
+                       profile="bench", mode="yolo", repeats=3))
+api.run(job.job_id)      # resumable; a usage limit pauses rather than fails
+api.dataset()            # every run on disk -> SQLite
 ```
 
-The same API has a JSON command surface:
+The same surface as a CLI, JSON on stdout:
 
 ```powershell
-python harness_bench_api.py tasks
-python harness_bench_api.py run --task 034-evidence-matrix-claims --mode yolo
-python harness_bench_api.py get medium-knowledge-1-a0e94b61
+python harness_bench_api.py new --model minimax/MiniMax-M3 --difficulty easy --repeats 3
+python harness_bench_api.py run JOB_ID
+python harness_bench_api.py status JOB_ID
+python harness_bench_api.py export
 ```
 
-`harness_bench.sqlite` contains normalized `trials`, `oracle_checks`,
-`model_calls`, `tool_calls`, `approvals`, and lossless `events` tables, plus
-`trial_efficiency` and `failed_checks` views. CSV mirrors and `events.jsonl`
-are included for notebooks and interchange. Existing runs can be exported with:
+`plan` spends nothing — it resolves the task list and writes `job.json`.
+Replicate *n* is the ordinary run directory `JOB_ID-r{n}`, so `--resume`, the
+viewer and `compare_harness_runs.py` all keep working on it. Calling `run`
+again after a pause skips finished replicates and resumes the rest; the
+launcher's conflict guard refuses to resume under a changed configuration.
+
+### Varying the plugin set
+
+`profiles.json` names the store packages a job installs. `seed` profiles are
+baked into the image by `build_template.py`; `runtime` profiles are deltas the
+entrypoint applies at container start, so comparing plugin sets costs a
+container start rather than two image builds.
 
 ```powershell
-python export_harness_bench_data.py --run RUN_ID `
-  --output results\harness-bench\analysis\my-sample
+python run_harness_bench.py --profile no-script --difficulty easy --execute
+```
+
+Shipped runtime profiles: `bench` (the seed as built), `no-script` (drops
+`run_script` and `validate`), `no-validate`, `no-subagents`, and `lean`. A
+failed install or removal kills the container rather than running the wrong
+configuration under the right label, and `live/profile.json` records the tools
+that were actually present.
+
+### Tokens, cost, and the database
+
+Token counts are the provider's own, from the `usage` block of its response —
+nothing here tokenises anything. `input_tokens_billed` sums each call's whole
+prompt, which is what you are charged for and **not** the context size
+(`input_tokens_largest_call` answers that). `cached_input_tokens` is the
+discounted share *of* the input, never an addition to it. A count the provider
+withheld stays `NULL`, and a missing price yields a `NULL` cost rather than a
+free-looking run.
+
+Prices live in `models.json` and cost is computed at export time, so correcting
+a price and re-exporting fixes every trial already on disk.
+
+`results/harness-bench/harness_bench.sqlite` holds `jobs`, `runs`, `trials`,
+`messages` (the transcript), `driver_rounds`, `model_calls`, `tool_calls`,
+`approvals` and `oracle_checks`, plus the `task_reliability` and
+`config_scores` views. `config_scores` averages per task before averaging
+across tasks, so unevenly repeated tasks cannot skew the headline number.
+
+Run directories are the source of truth and the database is derived, so
+re-exporting is always safe — unchanged runs are skipped by fingerprint:
+
+```powershell
+python export_harness_bench_data.py                    # refresh everything
+python export_harness_bench_data.py --run RUN_ID       # just one run
+python export_harness_bench_data.py --with-events      # include raw events
 ```

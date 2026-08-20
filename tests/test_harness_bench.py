@@ -55,24 +55,41 @@ def test_analysis_export_builds_joinable_sqlite_dataset(tmp_path: Path) -> None:
     official.write_text(json.dumps({"oracle_result": {"checks": [
         {"id": "answer", "pass": True, "weight": 1.0, "detail": "ok"},
     ]}}), encoding="utf-8")
-    (task / "events.jsonl").write_text(json.dumps({
-        "at": 1.0, "source": "llm", "kind": "llm_call",
-        "payload": {"model": "minimax/MiniMax-M3", "ok": True,
-                    "duration_s": 1.0, "prompt_tokens": 100},
-    }) + "\n", encoding="utf-8")
+    (task / "events.jsonl").write_text("\n".join(json.dumps(row) for row in (
+        {"at": 1.0, "source": "llm", "kind": "llm_call",
+         "payload": {"model": "minimax/MiniMax-M3", "ok": True, "duration_s": 1.0,
+                     "prompt_tokens": 100, "cached_prompt_tokens": 40,
+                     "completion_tokens": 10}},
+        {"at": 2.0, "source": "llm", "kind": "llm_call",
+         "payload": {"model": "minimax/MiniMax-M3", "ok": True, "duration_s": 1.0,
+                     "prompt_tokens": 200, "cached_prompt_tokens": 80,
+                     "completion_tokens": 20}},
+    )) + "\n", encoding="utf-8")
 
     output = tmp_path / "dataset"
     manifest = export_runs([run], output)
     connection = sqlite3.connect(output / "harness_bench.sqlite")
     try:
         row = connection.execute(
-            "SELECT outcome_score, prompt_tokens_known, estimated_input_cost_usd FROM trials"
-        ).fetchone()
-        assert row == (1.0, 100, 0.00003)
+            "SELECT outcome_score, input_tokens_billed, input_tokens_largest_call,"
+            " cached_input_tokens, input_tokens_uncached, output_tokens,"
+            " tokens_complete, cost_input_usd, cost_output_usd, cost_total_usd"
+            " FROM trials").fetchone()
+        # Billed input is the sum of both whole prompts (300); the largest
+        # single call (200) is the separate question of how big it got.
+        assert row[:6] == (1.0, 300, 200, 120, 180, 30)
+        assert row[6] == 1                       # both counts on every call
+        # models.json prices input at $0.30/Mtok and publishes no cached rate,
+        # so the whole 300 bills at the full rate: 300 * 0.30 / 1e6.
+        assert row[7] == 0.00009
+        # Output has no published price, so output and total stay NULL rather
+        # than being quietly reported as a complete cost.
+        assert row[8] is None and row[9] is None
         assert connection.execute("SELECT count(*) FROM oracle_checks").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM model_calls").fetchone()[0] == 2
     finally:
         connection.close()
-    assert manifest["trial_count"] == 1
+    assert manifest["rows_written"]["trials"] == 1
 
 
 def test_pinned_release_has_all_tasks_and_pilot_covers_categories() -> None:
@@ -177,7 +194,12 @@ def test_summary_keeps_scheduled_failures_in_denominator(tmp_path: Path) -> None
     assert summary["score_denominator"] == 2
     assert summary["completed"] == 1
     assert summary["llm_usage"]["calls"] == 1
-    assert summary["llm_usage"]["prompt_tokens_total_known"] == 123
+    assert summary["llm_usage"]["input_tokens_billed"] == 123
+    # The call reported no completion count, so the total is absent rather
+    # than zero and ``output_complete`` says why.
+    assert summary["llm_usage"]["output_tokens"] is None
+    assert summary["llm_usage"]["output_complete"] is False
+    assert summary["llm_usage"]["input_complete"] is True
 
 
 def test_viewer_loads_running_task_and_live_events(tmp_path: Path) -> None:
