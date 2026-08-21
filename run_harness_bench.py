@@ -226,7 +226,7 @@ def main(argv: list[str] | None = None) -> int:
                   f"Resume with: --resume {run_dir}", flush=True)
             exit_code = 130
             break
-        write_json(run_dir / "summary.json", summarize(run_dir, tasks))
+        write_summary(run_dir, tasks)
         if result.get("state") == "provider_unavailable":
             print("Provider quota/credit failure detected; stopping before another task is scheduled.")
             exit_code = 75
@@ -245,8 +245,7 @@ def main(argv: list[str] | None = None) -> int:
         if result.get("state") not in ("complete",):
             exit_code = 1
 
-    summary = summarize(run_dir, tasks)
-    write_json(run_dir / "summary.json", summary)
+    summary = write_summary(run_dir, tasks)
     print_summary(summary)
     return exit_code
 
@@ -927,6 +926,28 @@ def task_score(status: dict[str, Any] | None) -> float:
     return float(value) if isinstance(value, (int, float)) else 0.0
 
 
+def write_summary(run_dir: Path, task_ids: list[str]) -> dict[str, Any]:
+    """Refresh ``summary.json``, and never let that failure end the run.
+
+    The summary is **derived** -- every number in it is recomputed from the
+    per-task ``status.json`` files, which are the real record. Losing a write
+    costs a stale file until the next task finishes, or one ``--resume``.
+    Losing the run costs whatever the provider has already been paid.
+
+    So this reports and continues. The asymmetry is the whole point: an
+    unwritable derived file is an inconvenience, and it used to be a crash
+    that discarded a suite mid-flight.
+    """
+    summary = summarize(run_dir, task_ids)
+    try:
+        write_json(run_dir / "summary.json", summary)
+    except OSError as exc:                                   # noqa: BLE001
+        print(f"warning: could not update summary.json ({exc}); "
+              "the run continues and status.json remains authoritative",
+              file=sys.stderr)
+    return summary
+
+
 def summarize(run_dir: Path, task_ids: list[str]) -> dict[str, Any]:
     rows = []
     scores: list[float] = []
@@ -1140,11 +1161,34 @@ def read_json_text(value: str) -> Any:
         return value
 
 
-def write_json(path: Path, payload: Any) -> None:
+def write_json(path: Path, payload: Any, *, attempts: int = 12) -> None:
+    """Write atomically, retrying the swap while a reader holds the target.
+
+    **Windows cannot replace a file another process has open.** Python's
+    ``open()`` does not request ``FILE_SHARE_DELETE``, so any concurrent
+    reader makes ``os.replace`` fail with ``PermissionError`` (WinError 5) --
+    and this file is read once per second by the viewer's ``load_state`` while
+    the Live tab is open. Watching a run was therefore enough to kill it: the
+    launcher crashed mid-suite writing ``summary.json``, discarding a paid
+    run because somebody was looking at it.
+
+    A reader holds the file for microseconds, so a short backoff clears it.
+    The write itself is still atomic -- the retry is on the swap, never on
+    the content, so no reader ever sees a half-written file.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    temporary.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False, default=str) + "\n",
+        encoding="utf-8")
+    for attempt in range(attempts):
+        try:
+            temporary.replace(path)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.05 * (attempt + 1))       # ~3.9s over 12 attempts
 
 
 def git(root: Path, *args: str) -> str:

@@ -485,3 +485,78 @@ def test_several_writers_share_the_live_log_without_shredding_a_line(tmp_path: P
     lines = (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(lines) == 240
     assert all(json.loads(line)["kind"] == "decision" for line in lines)
+
+
+# -- writing while somebody is watching -------------------------------
+
+def test_an_atomic_write_survives_a_concurrent_reader(tmp_path: Path) -> None:
+    """Windows cannot replace a file another process holds open.
+
+    Python's open() does not request FILE_SHARE_DELETE, so os.replace fails
+    with PermissionError while any reader has the target open -- and
+    summary.json is read once per second by the viewer's load_state whenever
+    the Live tab is showing. Watching a run was therefore enough to crash it.
+
+    The retry is on the swap only, never on the content, so a reader still
+    never observes a partial file.
+    """
+    import threading
+    import time
+
+    from run_harness_bench import write_json
+
+    target = tmp_path / "summary.json"
+    write_json(target, {"n": -1})
+
+    stop = threading.Event()
+    seen = []
+
+    def poll():
+        while not stop.is_set():
+            try:
+                seen.append(json.loads(target.read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                seen.append(None)
+            time.sleep(0.002)
+
+    readers = [threading.Thread(target=poll, daemon=True) for _ in range(3)]
+    for reader in readers:
+        reader.start()
+    try:
+        for index in range(40):
+            write_json(target, {"n": index})
+    finally:
+        stop.set()
+        for reader in readers:
+            reader.join(timeout=2)
+
+    assert json.loads(target.read_text(encoding="utf-8")) == {"n": 39}
+    # Every observation was a whole document: the swap is still atomic.
+    assert all(row is None or "n" in row for row in seen)
+
+
+def test_an_unwritable_summary_does_not_end_a_paid_run(tmp_path: Path, monkeypatch) -> None:
+    """The asymmetry that matters.
+
+    summary.json is derived -- every number in it is recomputed from the
+    per-task status.json files. Losing the write costs a stale file until the
+    next task finishes. Losing the run costs whatever the provider was
+    already paid, and that is what used to happen.
+    """
+    import run_harness_bench as launcher
+
+    run = tmp_path / "run"
+    task = run / "tasks" / "a"
+    task.mkdir(parents=True)
+    (task / "status.json").write_text(json.dumps(
+        {"task_id": "a", "state": "complete", "outcome_score": 1.0}), encoding="utf-8")
+
+    def refuse(path, payload, **kwargs):
+        raise PermissionError(5, "Access is denied")
+
+    monkeypatch.setattr(launcher, "write_json", refuse)
+
+    # Returns the summary it could not persist, rather than raising.
+    summary = launcher.write_summary(run, ["a"])
+    assert summary["completion_score"] == 1.0
+    assert not (run / "summary.json").exists()
