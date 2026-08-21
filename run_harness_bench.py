@@ -600,6 +600,12 @@ def open_run(options, tasks, model, metadata, image_id):
         "template": template,
         "process_grade": "skipped",
         "oracle_quality_llm": "skipped",
+        # Scoring deviations from the pinned release, recorded so a comparison
+        # can tell whether two numbers were produced the same way. A task
+        # listed here is comparable with another run of *this* harness and not
+        # with a published Harness-Bench figure for the same task.
+        "oracle_normalizations": sorted(
+            task_id for task_id in tasks if task_id in ORACLE_GROUND_TRUTH_REWRITES),
         "reported_metric": "Harness-Bench deterministic completion",
     }
     return run_dir, run
@@ -715,10 +721,86 @@ def snapshot_problem(benchmark: Path, task_id: str) -> dict[str, Any]:
     }
 
 
+#: The idiom twelve of the thirteen Knowledge-class oracles use to find their
+#: own ``ground_truth.json``: resolve it beside the oracle module. Task 012
+#: instead walks up from the *workspace*, which never reaches the task
+#: directory -- upstream builds sandboxes at
+#: ``<work_root>/<model_id>/<api_slug>/oc-bench-v2-.../workspace``, so
+#: ``workspace.parent.parent`` is the api-slug directory in every
+#: configuration, ours included. See :func:`normalize_oracle_ground_truth`.
+ORACLE_GROUND_TRUTH_IDIOM = "Path(__file__).resolve().parent"
+#: Workspace-relative resolutions we rewrite, mapped to what they become. Kept
+#: as exact source text so an upstream revision that fixes or moves the line
+#: fails the assertion below instead of being silently "fixed" again.
+ORACLE_GROUND_TRUTH_REWRITES = {
+    "012-doc-synthesis": ("task_dir = w.parent.parent",
+                          f"task_dir = {ORACLE_GROUND_TRUTH_IDIOM}"),
+}
+
+
+def normalize_oracle_ground_truth(task_dir: Path, task_id: str) -> None:
+    """Make a staged oracle resolve ``ground_truth.json`` beside itself.
+
+    **A missing ground truth does not fail a task, it silently re-weights it.**
+    Task 012's oracle reads its expectations through ``Path.exists()`` and
+    carries on with ``{}`` when the read misses. The three branches then
+    disagree about what an empty expectation means: ``trust_assessment``
+    divides by ``len(expected)`` and falls through to ``else 0.0``, while
+    ``contradiction_detection`` and ``report_quality`` divide by empty lists
+    and default to a full ``1.0``. Every trial scores exactly
+    ``0*0.25 + 1*0.35 + 1*0.40 = 0.75`` no matter what the agent wrote, and
+    nothing downstream can tell that from three real results.
+
+    The rewrite happens on the staged copy. The pinned checkout under
+    ``build/`` keeps the revision recorded in ``benchmark.lock.json``.
+
+    Deviating from upstream scoring is deliberate and is recorded per run by
+    :func:`stage_benchmark`, because a task graded this way is **not**
+    comparable with a published Harness-Bench figure for the same task -- only
+    with another run of this harness.
+    """
+    rewrite = ORACLE_GROUND_TRUTH_REWRITES.get(task_id)
+    if rewrite is None:
+        return
+    oracle = task_dir / "oracle_grade.py"
+    before, after = rewrite
+    source = oracle.read_text(encoding="utf-8")
+    if before not in source:
+        # Either upstream fixed it or the line moved. Both mean this shim is
+        # now guessing, and a scoring shim that guesses is worse than none.
+        raise RuntimeError(
+            f"{task_id}: expected {before!r} in oracle_grade.py to rewrite, but it is "
+            "absent. The pinned benchmark revision changed; re-check whether "
+            "ORACLE_GROUND_TRUTH_REWRITES is still needed before running.")
+    oracle.write_text(source.replace(before, after), encoding="utf-8")
+
+
+def assert_ground_truth_reachable(task_dir: Path, task_id: str) -> None:
+    """Refuse to run when an oracle reads a ground truth that is not there.
+
+    Cheap insurance against the whole failure class rather than the one
+    instance of it: an oracle that mentions ``ground_truth.json`` and cannot
+    open it beside itself produces scores that look finished and are not.
+    """
+    oracle = task_dir / "oracle_grade.py"
+    if not oracle.is_file():
+        return
+    source = oracle.read_text(encoding="utf-8")
+    if "ground_truth.json" not in source:
+        return
+    if not (task_dir / "ground_truth.json").is_file():
+        raise RuntimeError(
+            f"{task_id}: oracle_grade.py reads ground_truth.json but the staged task "
+            "directory has no such file. Scoring would silently fall back to empty "
+            "expectations and report partial credit the agent did not earn.")
+
+
 def stage_benchmark(source: Path, dest: Path, task_id: str, mode: str, model: str) -> None:
     shutil.copytree(source / "src", dest / "src")
     shutil.copytree(source / "grading", dest / "grading")
     shutil.copytree(source / "tasks" / task_id, dest / "tasks" / task_id)
+    normalize_oracle_ground_truth(dest / "tasks" / task_id, task_id)
+    assert_ground_truth_reachable(dest / "tasks" / task_id, task_id)
     config = dest / "config"
     config.mkdir(parents=True)
     write_json(config / "app.json", {

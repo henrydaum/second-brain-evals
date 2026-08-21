@@ -1,7 +1,10 @@
+import importlib.util
 import json
 import shutil
 import threading
 from pathlib import Path
+
+import pytest
 
 from driver import live
 from driver.approver import Approver, Manifest
@@ -17,9 +20,11 @@ from run_harness_bench import (
     DRIVER_COLLECT_MARGIN_S,
     ProviderUnavailableError,
     SELECTIONS,
+    assert_ground_truth_reachable,
     detect_provider_failure,
     fetch_benchmark,
     find_official_result,
+    normalize_oracle_ground_truth,
     provider_preflight,
     snapshot_problem,
     stage_benchmark,
@@ -156,6 +161,67 @@ def test_stage_uses_generic_cli_and_requested_mode(tmp_path: Path) -> None:
     assert app["work_root"] == CONTAINER_WORK_ROOT
     assert app["work_root"].startswith("/data/Second Brain/workspace/")
     assert (stage / "tasks" / "033-offline-knowledge-qa" / "oracle_grade.py").is_file()
+
+
+def test_staged_oracle_resolves_ground_truth_beside_itself(tmp_path: Path) -> None:
+    """012's oracle walked up from the workspace and never reached its own task
+    directory, so every trial scored a fixed 0.75: a forced zero on the branch
+    that divides by the expectation count, and free full marks on the two that
+    divide by empty lists."""
+    stage = tmp_path / "harnessbench"
+    stage_benchmark(DEFAULT_BENCHMARK, stage, "012-doc-synthesis", "yolo", "openai/fake")
+    task_dir = stage / "tasks" / "012-doc-synthesis"
+    source = (task_dir / "oracle_grade.py").read_text(encoding="utf-8")
+
+    assert "w.parent.parent" not in source
+    assert "task_dir = Path(__file__).resolve().parent" in source
+    assert (task_dir / "ground_truth.json").is_file()
+
+    truth = json.loads((task_dir / "ground_truth.json").read_text(encoding="utf-8"))
+    workspace = tmp_path / "sandbox" / "run" / "workspace"
+    out = workspace / "out"
+    out.mkdir(parents=True)
+    # Exactly the expected trust scores, and contradictions whose claims match
+    # nothing. Under a loaded ground truth that is accuracy 1.0 and coverage
+    # 0.0; under the empty one it was the reverse -- a forced 0.0 and a free
+    # 1.0 -- so this workspace tells the two apart.
+    (out / "trustworthiness.json").write_text(json.dumps(
+        {doc: {"score": score, "reason": "r"}
+         for doc, score in truth["expected_trust_scores"].items()}), encoding="utf-8")
+    (out / "contradictions.json").write_text(json.dumps(
+        {"contradictions": [{"claim": "nothing the ground truth asks about",
+                             "documents": [], "quotes": [], "resolution": ""}]}), encoding="utf-8")
+    (out / "final_report.md").write_text("prose. " * 400, encoding="utf-8")
+
+    spec = importlib.util.spec_from_file_location("oracle_012", task_dir / "oracle_grade.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    checks = {check["id"]: check for check in module.score_workspace(workspace)["checks"]}
+
+    assert checks["trust_assessment"]["detail"]["accuracy"] == 1.0
+    assert checks["trust_assessment"]["pass"] is True
+    assert checks["contradiction_detection"]["detail"]["coverage"] == 0.0
+
+
+def test_stage_refuses_a_task_whose_ground_truth_cannot_be_read(tmp_path: Path) -> None:
+    stage = tmp_path / "harnessbench"
+    stage_benchmark(DEFAULT_BENCHMARK, stage, "033-offline-knowledge-qa", "yolo", "openai/fake")
+    task_dir = stage / "tasks" / "033-offline-knowledge-qa"
+    (task_dir / "ground_truth.json").unlink()
+
+    with pytest.raises(RuntimeError, match="ground_truth.json"):
+        assert_ground_truth_reachable(task_dir, "033-offline-knowledge-qa")
+
+
+def test_ground_truth_rewrite_fails_loudly_if_upstream_moves_the_line(tmp_path: Path) -> None:
+    """A scoring shim that silently no-ops is worse than no shim: the run looks
+    graded and is not."""
+    task_dir = tmp_path / "012-doc-synthesis"
+    task_dir.mkdir()
+    (task_dir / "oracle_grade.py").write_text("task_dir = somewhere_else\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="ORACLE_GROUND_TRUTH_REWRITES"):
+        normalize_oracle_ground_truth(task_dir, "012-doc-synthesis")
 
 
 def test_round_detection_and_lockdown_manifest(tmp_path: Path) -> None:
