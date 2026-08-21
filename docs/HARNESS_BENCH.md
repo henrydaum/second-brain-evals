@@ -120,27 +120,31 @@ there are classified `SAFE`, they raise no dialog, and therefore:
   They are kept because they document intent and would bind if the workspace
   ever moved, not because they fire today.
 
-So a mode comparison over this suite measures the cost of refusing
-**`proc.run` (non-read-only shell), `script.run`, `net.http`, and
-`secret.reveal`** — the families in `sandbox/policy.py`'s `CONSEQUENTIAL` set.
+So a mode comparison over this suite primarily measures the cost of refusing
+**unrecognized `proc.run`, foreign-library `script.run`, `net.http`, and
+`secret.reveal`**. A valid contained `script.run` is safe; validation and path
+errors fail during launch preflight rather than entering approval policy.
 It does **not** measure "how much capability the security boundary costs" in
 general, and a published delta must say which of the two it is.
 
 Two further caveats worth carrying with the number:
 
-- Read-only shell is narrower than it sounds. `sandbox/shell.py` classifies
-  `git status`, `git log`, `git diff` and similar as `SAFE`, but **`ls` and
-  `cat` are deliberately excluded** — the kernel's own comment says
-  `sdk.fs.read`/`sdk.fs.list` "do these mediated and better. A dialog is the
-  right nudge toward the SDK." So under `lockdown` the agent cannot list a
-  directory with the shell. Observed in practice: `proc.run: denied: run
-  shell command: ls -la ...`, six times in one run. The mode delta therefore
-  includes basic filesystem inspection, not only consequential acts, and it
-  is a design choice about steering rather than a security necessity.
+- Read-only shell remains deliberately narrow. Alongside selected `git`
+  queries, conservative `ls` display forms and `cat` of regular,
+  non-protected, size-bounded files are safe. Globs, redirection, substitution,
+  stdin, devices, unsupported flags, and non-POSIX aliases still fall through
+  to approval. Prefer the mediated file tools when they are installed.
 - **Lockdown's cost does not appear as approval denials.** A standing refusal
   never raises a dialog, so `approvals_denied` is zero and the refusals land
   in `tool_errors` and `driver_rounds.ledger_refused` instead. A comparison
   that counts denials to measure the security cost will measure nothing.
+- Keep three failure classes separate in analysis: a policy refusal means the
+  requested effect was disallowed; a preflight failure means inputs or source
+  were invalid before execution; an execution failure means work started and
+  failed. A foreground or completed-background shell process with a nonzero
+  exit is an execution failure and, in current store builds, a top-level tool
+  failure. Older trials may show exit text inside a successful tool event and
+  should be tagged as legacy telemetry rather than compared directly.
 - `net_allowed_hosts` is empty in the benchmark template, so the tasks that
   stand up a local HTTP service raise a `net.http` dialog. Those are approved
   under `yolo`, refused under `lockdown`, and — because the manifest declares
@@ -244,6 +248,7 @@ Which store packages the agent has is a variable, not a constant, and
 ```
 --profile bench         the seed as built
 --profile no-script     drops run_script and validate
+--profile no-validate   keeps run_script but drops validate
 --profile no-subagents  drops spawn/schedule_subagent
 --profile lean          file and shell work only
 ```
