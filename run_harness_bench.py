@@ -13,6 +13,7 @@ import json
 import os
 import posixpath
 import re
+import shlex
 import shutil
 import statistics
 import subprocess
@@ -50,9 +51,14 @@ RESULTS = ROOT / "results" / "harness-bench"
 #: run under ``--profile no-script`` legitimately has fewer tools and a
 #: constant would quietly misreport it. Only the self-test may compare against
 #: this, and only because the self-test always runs the default profile.
+#: ``web_search`` and ``sql_query`` are absent deliberately. Several tasks
+#: forbid internet search outright, so exposing the tool only creates a
+#: violation for the oracle to punish, and ``sql_query`` was never called once
+#: across every run recorded. ``bench-full`` keeps both for reproducing older
+#: runs.
 BENCHMARK_TOOLS = {
     "edit_file", "glob", "grep", "read_file", "run_command", "run_script",
-    "schedule_subagent", "spawn_subagent", "sql_query", "validate", "web_search",
+    "schedule_subagent", "spawn_subagent", "validate",
 }
 CONTAINER_BENCH_ROOT = "/work/harnessbench"
 # run_command deliberately accepts cwd only under Second Brain's application
@@ -95,6 +101,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--profile", default="bench", choices=sorted(PROFILES),
                         help="plugin set, applied at container start (see profiles.json)")
     parser.add_argument("--model", help="model id from models.json; overrides SB_LLM_MODEL")
+    parser.add_argument("--judge", default="none",
+                        choices=["none", *sorted(MODELS)],
+                        help="model id from models.json to grade process and security; "
+                             "'none' (default) skips the LLM judge and pins both to 1.0")
     parser.add_argument("--benchmark-root", default=str(DEFAULT_BENCHMARK))
     parser.add_argument("--fetch-benchmark", action="store_true", help="clone/fetch the exact pinned upstream revision")
     parser.add_argument("--env-file", default="bench.env")
@@ -216,6 +226,7 @@ def main(argv: list[str] | None = None) -> int:
                 keep_container=options.keep_container,
                 position=f"{index}/{len(tasks)}",
                 env_overrides=env_overrides,
+                judge=run.get("judge"),
             )
         except KeyboardInterrupt:
             # A *second* Ctrl+C, landing while the first one's cleanup was
@@ -598,7 +609,14 @@ def open_run(options, tasks, model, metadata, image_id):
         "image": options.image,
         "image_id": image_id,
         "template": template,
-        "process_grade": "skipped",
+        # Which judge produced the process and security factors, or nothing.
+        # ``combined = outcome x process x security``, so a run without a judge
+        # reports two of the three as an assumed 1.0 rather than a measurement,
+        # and two runs graded by different judges are not comparable.
+        "judge": None if getattr(options, "judge", "none") == "none" else options.judge,
+        "judge_spec": MODELS.get(getattr(options, "judge", "none")),
+        "process_grade": ("skipped" if getattr(options, "judge", "none") == "none"
+                          else f"llm judge: {options.judge}"),
         "oracle_quality_llm": "skipped",
         # Scoring deviations from the pinned release, recorded so a comparison
         # can tell whether two numbers were produced the same way. A task
@@ -612,7 +630,7 @@ def open_run(options, tasks, model, metadata, image_id):
 
 
 def run_one_task(*, task_id, task_dir, benchmark, env_file, image, mode, model,
-                 keep_container, position, env_overrides=None):
+                 keep_container, position, env_overrides=None, judge=None):
     task_dir.mkdir(parents=True, exist_ok=True)
     write_json(task_dir / "problem.json", snapshot_problem(benchmark, task_id))
     status = {"task_id": task_id, "state": "running", "started_at": time.time(),
@@ -639,11 +657,19 @@ def run_one_task(*, task_id, task_dir, benchmark, env_file, image, mode, model,
                 "-e", "PYTHONUTF8=1",
                 "-e", "HARNESSBENCH_APP_CONFIG=/work/harnessbench/config/app.json",
                 "-e", "HARNESSBENCH_HARNESS_CONFIG=/work/harnessbench/config/harness.json",
-                "-e", "HARNESSBENCH_SKIP_PROCESS_GRADE=1",
+                # The oracle-quality LLM stays off whatever the judge setting:
+                # its weight is 0 for every task except the two vision ones, so
+                # enabling it buys nothing here and costs a call per trial.
                 "-e", "HARNESSBENCH_SKIP_ORACLE_QUALITY_LLM=1",
+                *judge_env(judge),
                 container,
-                "python", "-m", "harnessbench.cli", "run-task",
-                "--task", task_id, "--harness", "second-brain", "--mode", "live",
+                # The judge's key is read from the container's own environment
+                # rather than passed on this command line, so it never reaches
+                # a process list or a harness log.
+                "sh", "-c",
+                'RUBRIC_API_KEY="${RUBRIC_API_KEY:-$SB_LLM_API_KEY}" '
+                "exec python -m harnessbench.cli run-task "
+                f"--task {shlex.quote(task_id)} --harness second-brain --mode live",
             ]
             returncode = run_logged(command, task_dir / "harness.log")
     except KeyboardInterrupt:
@@ -793,6 +819,42 @@ def assert_ground_truth_reachable(task_dir: Path, task_id: str) -> None:
             f"{task_id}: oracle_grade.py reads ground_truth.json but the staged task "
             "directory has no such file. Scoring would silently fall back to empty "
             "expectations and report partial credit the agent did not earn.")
+
+
+def judge_env(judge: str | None) -> list[str]:
+    """Docker ``-e`` flags that turn the LLM process grader on, or leave it off.
+
+    **The judge is a control variable, not a setting.** ``combined = outcome x
+    process x security``, and with no judge the last two are pinned to exactly
+    1.0 -- a constant, contributing no variance. Turning one on replaces that
+    constant with an estimate, so two runs graded by different judges are not
+    comparable even when everything else matches, and a run graded by a weak
+    judge carries that judge's noise into every number multiplicatively. Which
+    is why the choice is recorded per run rather than read from the
+    environment.
+
+    The API key is deliberately absent: the command reads it inside the
+    container so it never lands in a process list or a log.
+    """
+    if not judge or judge == "none":
+        return ["-e", "HARNESSBENCH_SKIP_PROCESS_GRADE=1"]
+    spec = MODELS.get(judge) or {}
+    endpoint = spec.get("endpoint")
+    if not endpoint:
+        raise RuntimeError(
+            f"--judge {judge!r} has no endpoint in models.json; the grader needs "
+            "an OpenAI-compatible /chat/completions base URL.")
+    # The grader POSTs straight to ``{base}/chat/completions`` with urllib, so
+    # it needs the provider's own model name. ``minimax/MiniMax-M3`` is a
+    # LiteLLM routing id and that endpoint does not know it.
+    api_model = spec.get("api_model") or judge.split("/", 1)[-1]
+    flags = ["-e", f"RUBRIC_BASE_URL={endpoint}", "-e", f"RUBRIC_MODEL={api_model}"]
+    # A judge on a different provider needs its own key. Naming the variable
+    # in models.json keeps that a data change rather than a code change; the
+    # container falls back to the run's own key when nothing is named.
+    if spec.get("api_key_env"):
+        flags += ["-e", f"RUBRIC_API_KEY=${{{spec['api_key_env']}}}"]
+    return flags
 
 
 def stage_benchmark(source: Path, dest: Path, task_id: str, mode: str, model: str) -> None:

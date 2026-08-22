@@ -54,7 +54,7 @@ MODELS_FILE = ROOT / "models.json"
 SCHEMA: dict[str, dict[str, str]] = {
     "jobs": {
         "job_id": "TEXT PRIMARY KEY", "state": "TEXT", "model": "TEXT",
-        "profile": "TEXT", "mode": "TEXT", "repeats": "INTEGER",
+        "profile": "TEXT", "mode": "TEXT", "judge": "TEXT", "repeats": "INTEGER",
         "task_count": "INTEGER", "trial_count": "INTEGER",
         "selector_json": "TEXT", "notes": "TEXT", "created_at": "REAL",
         "updated_at": "REAL", "paused_reason": "TEXT",
@@ -63,6 +63,10 @@ SCHEMA: dict[str, dict[str, str]] = {
         "run_id": "TEXT PRIMARY KEY", "job_id": "TEXT", "replicate": "INTEGER",
         "created_at": "REAL", "mode": "TEXT", "model": "TEXT", "profile": "TEXT",
         "tool_profile": "TEXT", "visible_tools_json": "TEXT",
+        # NULL means process and security were not measured but assumed 1.0,
+        # so the run's score is completion alone. Two runs graded by different
+        # judges are not comparable; grouping by this column keeps them apart.
+        "judge": "TEXT",
         "kernel_commit": "TEXT", "store_commit": "TEXT",
         "benchmark_commit": "TEXT", "image": "TEXT", "image_id": "TEXT",
         "task_count": "INTEGER", "completion_score": "REAL",
@@ -742,6 +746,7 @@ def export_runs(run_dirs: list[Path], output: Path, *, with_events: bool = False
                 "mode": run.get("mode"), "model": run.get("model"),
                 "profile": run.get("profile"), "tool_profile": run.get("tool_profile"),
                 "visible_tools_json": json_cell(run.get("visible_tools")),
+                "judge": run.get("judge"),
                 "kernel_commit": (run.get("template") or {}).get("kernel_commit"),
                 "store_commit": (run.get("template") or {}).get("store_commit"),
                 "benchmark_commit": run.get("benchmark_commit"),
@@ -838,7 +843,8 @@ def job_rows(results_root: Path) -> list[dict[str, Any]]:
         rows.append({
             "job_id": payload.get("job_id"), "state": payload.get("state"),
             "model": spec.get("model"), "profile": spec.get("profile"),
-            "mode": spec.get("mode"), "repeats": spec.get("repeats"),
+            "mode": spec.get("mode"), "judge": spec.get("judge"),
+            "repeats": spec.get("repeats"),
             "task_count": len(payload.get("tasks") or []),
             "trial_count": payload.get("trial_count"),
             "selector_json": json_cell(spec.get("tasks")),

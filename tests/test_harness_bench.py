@@ -34,10 +34,20 @@ from run_harness_bench import (
 )
 
 
-def test_benchmark_profile_only_removes_interactive_tools() -> None:
-    assert "ask_question" not in BENCHMARK_TOOLS
-    assert "show_files" not in BENCHMARK_TOOLS
-    assert {"run_command", "run_script", "web_search", "spawn_subagent"} <= BENCHMARK_TOOLS
+def test_benchmark_profile_drops_interactive_prohibited_and_unused_tools() -> None:
+    """Three separate reasons, and the last two are not interchangeable.
+
+    ``ask_question`` and ``show_files`` need a user who is not there.
+    ``web_search`` is forbidden by several task constraints, so offering it
+    manufactures a violation for the oracle to punish. ``sql_query`` is merely
+    unused -- zero calls across every run recorded -- and costs prompt tokens
+    in every request to say so.
+    """
+    for interactive in ("ask_question", "show_files"):
+        assert interactive not in BENCHMARK_TOOLS
+    for withdrawn in ("web_search", "sql_query"):
+        assert withdrawn not in BENCHMARK_TOOLS
+    assert {"run_command", "run_script", "spawn_subagent"} <= BENCHMARK_TOOLS
 from view_harness_bench import HTML, load_state
 
 
@@ -626,3 +636,66 @@ def test_an_unwritable_summary_does_not_end_a_paid_run(tmp_path: Path, monkeypat
     summary = launcher.write_summary(run, ["a"])
     assert summary["completion_score"] == 1.0
     assert not (run / "summary.json").exists()
+
+
+def test_judge_off_by_default_and_never_puts_the_key_on_the_command_line() -> None:
+    """The judge is a control variable, so its absence has to be visible too.
+
+    ``combined = outcome x process x security``. With no judge the last two are
+    pinned to exactly 1.0 -- a constant contributing no variance -- so a score
+    is completion alone. Turning one on replaces that constant with an
+    estimate, which is why the run records which judge, and why two runs graded
+    differently cannot be compared.
+    """
+    from run_harness_bench import MODELS, judge_env
+
+    off = judge_env("none")
+    assert "HARNESSBENCH_SKIP_PROCESS_GRADE=1" in off
+    assert judge_env(None) == off
+
+    judge = sorted(MODELS)[0]
+    on = judge_env(judge)
+    assert "HARNESSBENCH_SKIP_PROCESS_GRADE=1" not in on
+    joined = " ".join(on)
+    assert f"RUBRIC_BASE_URL={MODELS[judge]['endpoint']}" in joined
+    # The bare provider model name, not the LiteLLM routing id: the grader
+    # POSTs straight to {base}/chat/completions and that endpoint has never
+    # heard of "minimax/MiniMax-M3".
+    assert f"RUBRIC_MODEL={judge.split('/', 1)[-1]}" in joined
+    assert "/" not in joined.split("RUBRIC_MODEL=")[1].split()[0]
+    # A key would end up in the process list and every harness log.
+    assert not any("RUBRIC_API_KEY=" in flag and "${" not in flag for flag in on)
+
+
+def test_proxy_capture_replays_through_the_upstream_reader(tmp_path: Path) -> None:
+    """The process grader reads a proxy capture we never recorded, so the
+    transcript is re-expanded into one and the grader's own differ has to
+    recover it."""
+    import sys
+
+    sys.path.insert(0, str(DEFAULT_BENCHMARK / "src"))
+    from harnessbench.extract_proxy_trace import extract_proxy_trace_incremental
+
+    from driver import proxy_trace
+
+    messages = [
+        {"role": "user", "content": "audit the claims"},
+        {"role": "assistant", "content": json.dumps(
+            {"content": None, "tool_calls": [{"id": "c1", "type": "function",
+             "function": {"name": "read_file", "arguments": "{}"}}]})},
+        {"role": "tool", "content": "claim,source\n1,a", "tool_call_id": "c1",
+         "tool_name": "read_file"},
+        {"role": "assistant", "content": json.dumps({"content": "one claim, supported."})},
+    ]
+    assert proxy_trace.write(tmp_path, messages) == 2
+
+    trace = extract_proxy_trace_incremental(tmp_path / "usage-proxy")
+    assert not trace.get("error")
+    assert len(trace["rounds"]) == 2
+    unified = trace["unified_transcript"]
+    assert [m["role"] for m in unified][:2] == ["user", "assistant"]
+    assert any("one claim, supported." in (m.get("content") or "") for m in unified)
+    # A second round appends rather than replacing, or a multi-round task
+    # would grade only its last round.
+    assert proxy_trace.write(tmp_path, messages) == 2
+    assert len(extract_proxy_trace_incremental(tmp_path / "usage-proxy")["rounds"]) == 4

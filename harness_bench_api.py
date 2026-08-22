@@ -66,6 +66,10 @@ class JobSpec:
     tasks: dict[str, Any] = field(default_factory=dict)
     profile: str = "bench"
     mode: str = "yolo"
+    #: Model that grades process and security, or ``"none"`` to leave both
+    #: pinned at 1.0. Recorded per job because it is a control variable: two
+    #: jobs graded by different judges are not comparable.
+    judge: str = "none"
     repeats: int = 1
     env_file: str = "bench.env"
     image: str = DEFAULT_IMAGE
@@ -81,6 +85,9 @@ class JobSpec:
         if self.mode not in MODES:
             raise ValueError(f"unsupported mode {self.mode!r}; expected one of "
                              + ", ".join(MODES))
+        if self.judge != "none" and self.judge not in MODELS:
+            raise ValueError(f"unknown judge {self.judge!r}; models.json knows: "
+                             + ", ".join(sorted(MODELS)) + ", or 'none'")
         if self.repeats < 1:
             raise ValueError("repeats must be at least 1")
         unknown = sorted(set(self.tasks) - set(SELECTOR_KEYS) - {"exclude"})
@@ -195,7 +202,7 @@ class HarnessBenchAPI:
                 "--benchmark-root", str(self.benchmark_root),
                 "--env-file", spec.env_file, "--image", spec.image,
                 "--mode", spec.mode, "--profile", spec.profile,
-                "--model", spec.model,
+                "--model", spec.model, "--judge", spec.judge,
             ]
             for task_id in payload["tasks"]:
                 command.extend(("--task", task_id))
@@ -377,6 +384,8 @@ def main(argv: list[str] | None = None) -> int:
     new.add_argument("--model", required=True)
     new.add_argument("--profile", default="bench", choices=sorted(PROFILES))
     new.add_argument("--mode", default="yolo", choices=MODES)
+    new.add_argument("--judge", default="none", choices=["none", *sorted(MODELS)],
+                     help="model that grades process and security; 'none' pins both to 1.0")
     new.add_argument("--repeats", type=int, default=1)
     new.add_argument("--task", action="append", help="exact task id; repeatable")
     new.add_argument("--difficulty", action="append")
@@ -418,6 +427,7 @@ def main(argv: list[str] | None = None) -> int:
                     "smoke": options.smoke}
         result = api.plan(JobSpec(
             model=options.model, profile=options.profile, mode=options.mode,
+            judge=options.judge,
             repeats=options.repeats, env_file=options.env_file,
             notes=options.notes,
             tasks={key: value for key, value in selector.items() if value},

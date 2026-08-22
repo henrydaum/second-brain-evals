@@ -25,7 +25,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from driver import collect, turn                        # noqa: E402
+from driver import collect, proxy_trace, turn           # noqa: E402
 from driver.approver import Approver, Manifest          # noqa: E402
 from driver.wire import Client                          # noqa: E402
 
@@ -131,6 +131,16 @@ def main(argv=None):
     _write(out, "approvals.json", approver.decisions)
     _write(out, "questions.json", approver.questions)
     _write(out, "transcript.json", said)
+    # The process grader reads a proxy capture we do not otherwise produce.
+    # Written beside the bundle rather than inside it because the grader looks
+    # for it at the sandbox root. A failure here must not cost the run: the
+    # deliverable is already on disk and the oracle does not need this.
+    try:
+        rounds = proxy_trace.write(os.path.dirname(os.path.dirname(out)),
+                                   said.get("messages") or [])
+        _stamped(f"[proxy] wrote {rounds} rounds for the process grader")
+    except Exception as exc:                             # noqa: BLE001
+        _stamped(f"[proxy] capture failed, process grade will default: {exc}")
     _write(out, "ledger.json", effects)
     _write(out, "files.json", files)
 

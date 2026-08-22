@@ -198,6 +198,7 @@ DASHBOARD_BODY = """
  <h2>New job</h2>
  <div class="grid">
   <div><label>Model</label><select id="model"></select></div>
+  <div><label>Judge <span class="muted">grades process &amp; security</span></label><select id="judge"></select></div>
   <div><label>Plugin profile</label><select id="profile"></select></div>
   <div><label>Permission mode</label><select id="mode"></select></div>
   <div><label>Repeats</label><input type="number" id="repeats" value="1" min="1" max="20"></div>
@@ -272,6 +273,10 @@ async function preview(){
 async function load(){
   catalog = await (await fetch('/api/catalog')).json();
   $('model').innerHTML = catalog.models.map(m => `<option>${esc(m)}</option>`).join('');
+  // Off by default. With no judge, process and security are a pinned 1.0 and
+  // the score is completion alone -- which is what every run so far reported.
+  $('judge').innerHTML = '<option value="none">none — completion only</option>' +
+    catalog.models.map(m => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
   $('profile').innerHTML = catalog.profiles.map(p =>
     `<option value="${esc(p.name)}"${p.blocked ? ' disabled' : ''}>${esc(p.name)}` +
     `${p.blocked ? ' (needs image rebuild)' : ''} — ${esc(p.description)}</option>`).join('');
@@ -309,7 +314,9 @@ async function refresh(){
           : `<a href="/data">results</a>`);
     return `<tr><td>${esc(j.job_id)}</td><td class="${cls}">${esc(j.state)}` +
       (j.paused_reason ? ` <span class="muted">(${esc(j.paused_reason)})</span>` : '') +
-      `</td><td>${esc(j.model)}</td><td>${esc(j.profile)}</td><td>${esc(j.mode)}</td>` +
+      `</td><td>${esc(j.model)}` +
+      (j.judge && j.judge !== 'none' ? ` <span class="muted">judge: ${esc(j.judge)}</span>` : '') +
+      `</td><td>${esc(j.profile)}</td><td>${esc(j.mode)}</td>` +
       `<td>${esc(j.repeats)}</td><td>${esc(j.trial_count)}</td>` +
       `<td>${esc(j.completed)}</td><td class="muted">${esc(j.notes || '')}</td>` +
       `<td>${action}</td></tr>`;
@@ -329,7 +336,8 @@ $('go').onclick = async () => {
   $('formError').textContent = '';
   $('go').disabled = true;
   const body = {
-    model: $('model').value, profile: $('profile').value, mode: $('mode').value,
+    model: $('model').value, judge: $('judge').value,
+    profile: $('profile').value, mode: $('mode').value,
     repeats: parseInt($('repeats').value) || 1, notes: $('notes').value,
     tasks: selector(),
   };
@@ -534,6 +542,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     tasks=body.get("tasks") or {},
                     profile=body.get("profile") or "bench",
                     mode=body.get("mode") or "yolo",
+                    judge=body.get("judge") or "none",
                     repeats=int(body.get("repeats") or 1),
                     notes=body.get("notes") or "",
                 )

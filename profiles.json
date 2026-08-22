@@ -28,7 +28,12 @@
   },
   "runtime": {
     "bench": {
-      "description": "The seed as built: Essentials minus interactive-only pieces.",
+      "description": "Essentials minus interactive-only pieces, web search, and SQL. Search is forbidden by task constraints, so offering it invites a violation the oracle then punishes; sql_query drew zero calls across every run recorded so far. Both cost prompt tokens in every request to sit unused.",
+      "add": [],
+      "remove": ["tool_web_search", "tool_sql_query"]
+    },
+    "bench-full": {
+      "description": "The seed exactly as built, web search and SQL included. Kept so a run can be reproduced against the tool set used before those two were dropped.",
       "add": [],
       "remove": []
     },

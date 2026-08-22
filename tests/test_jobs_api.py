@@ -676,8 +676,11 @@ def test_a_profile_the_image_cannot_apply_is_fatal(tmp_path: Path, monkeypatch) 
     verdict = image_freshness("no-script")
     assert verdict["fatal"] and "no-script" in verdict["fatal"][0]
 
-    # The default profile asks for no delta, so the same image is fine for it.
-    assert image_freshness("bench")["fatal"] == []
+    # A profile asking for no delta is fine on the same image. ``bench`` is no
+    # longer that profile -- it withdraws web_search and sql_query, so an image
+    # that cannot apply a removal would run them while the label denied it.
+    assert image_freshness("bench-full")["fatal"] == []
+    assert image_freshness("bench")["fatal"]
 
 
 def test_a_moved_kernel_warns_but_does_not_block(tmp_path: Path, monkeypatch) -> None:
