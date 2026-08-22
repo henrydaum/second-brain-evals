@@ -34,20 +34,23 @@ from run_harness_bench import (
 )
 
 
-def test_benchmark_profile_drops_interactive_prohibited_and_unused_tools() -> None:
-    """Three separate reasons, and the last two are not interchangeable.
+def test_benchmark_profile_drops_interactive_and_prohibited_tools() -> None:
+    """Two reasons, and they are not the same reason.
 
     ``ask_question`` and ``show_files`` need a user who is not there.
     ``web_search`` is forbidden by several task constraints, so offering it
-    manufactures a violation for the oracle to punish. ``sql_query`` is merely
-    unused -- zero calls across every run recorded -- and costs prompt tokens
-    in every request to say so.
+    manufactures a violation for the oracle to punish.
+
+    ``sql_query`` stays. It drew no calls on the evidence corpus, but that
+    corpus has no database in it -- a category that does would have said
+    otherwise, and withdrawing a tool on evidence from tasks that could never
+    use it is how a profile gets tuned to one slice of the suite.
     """
     for interactive in ("ask_question", "show_files"):
         assert interactive not in BENCHMARK_TOOLS
-    for withdrawn in ("web_search", "sql_query"):
-        assert withdrawn not in BENCHMARK_TOOLS
-    assert {"run_command", "run_script", "spawn_subagent"} <= BENCHMARK_TOOLS
+    assert "web_search" not in BENCHMARK_TOOLS
+    assert {"run_command", "run_script", "spawn_subagent",
+            "sql_query"} <= BENCHMARK_TOOLS
 from view_harness_bench import HTML, load_state
 
 

@@ -51,14 +51,12 @@ RESULTS = ROOT / "results" / "harness-bench"
 #: run under ``--profile no-script`` legitimately has fewer tools and a
 #: constant would quietly misreport it. Only the self-test may compare against
 #: this, and only because the self-test always runs the default profile.
-#: ``web_search`` and ``sql_query`` are absent deliberately. Several tasks
-#: forbid internet search outright, so exposing the tool only creates a
-#: violation for the oracle to punish, and ``sql_query`` was never called once
-#: across every run recorded. ``bench-full`` keeps both for reproducing older
-#: runs.
+#: ``web_search`` is absent deliberately: several tasks forbid internet search
+#: outright, so exposing the tool only creates a violation for the oracle to
+#: punish. ``bench-full`` keeps it for reproducing older runs.
 BENCHMARK_TOOLS = {
     "edit_file", "glob", "grep", "read_file", "run_command", "run_script",
-    "schedule_subagent", "spawn_subagent", "validate",
+    "schedule_subagent", "spawn_subagent", "sql_query", "validate",
 }
 CONTAINER_BENCH_ROOT = "/work/harnessbench"
 # run_command deliberately accepts cwd only under Second Brain's application
