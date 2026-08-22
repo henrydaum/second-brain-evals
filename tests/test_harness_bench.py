@@ -702,3 +702,54 @@ def test_proxy_capture_replays_through_the_upstream_reader(tmp_path: Path) -> No
     # would grade only its last round.
     assert proxy_trace.write(tmp_path, messages) == 2
     assert len(extract_proxy_trace_incremental(tmp_path / "usage-proxy")["rounds"]) == 4
+
+
+def test_judge_scores_are_flattened_per_dimension_and_null_when_absent() -> None:
+    """Turning the judge on has to change a number somebody looks at.
+
+    The mean alone cannot say which half of a run was weak, and the two
+    dimensions the kernel's own changes move -- tool use and robustness -- are
+    exactly the ones it averages away.
+    """
+    from run_harness_bench import judge_scores
+
+    graded = judge_scores({
+        "process_score": 0.72, "security_score": 1.0,
+        "rubric_model": "MiniMax-M3",
+        "rubric": {"scores": {"tool_use_appropriate": 0.5, "consistency": 0.9,
+                              "robustness": 0.76}, "notes": "much shell flailing"},
+        "combined_score": 0.53,
+    })
+    assert graded["process_score"] == 0.72
+    assert graded["judge_tool_use"] == 0.5
+    assert graded["judge_robustness"] == 0.76
+    assert graded["judge_model"] == "MiniMax-M3"
+    assert graded["judge_notes"] == "much shell flailing"
+
+    # Older rubrics name two of the three differently, and the mean upstream
+    # computes accepts either spelling, so reading only one would drop a
+    # dimension silently.
+    legacy = judge_scores({"rubric": {"scores": {"flow_coherence": 0.4,
+                                                 "error_handling": 0.6}}})
+    assert legacy["judge_consistency"] == 0.4
+    assert legacy["judge_robustness"] == 0.6
+
+    # No judge: every key present and None. An absent key would read as "not
+    # recorded yet" downstream; None reads as "not measured", which is what a
+    # run graded without a judge actually is.
+    ungraded = judge_scores({"rubric": {"skipped": True}})
+    assert set(ungraded) == set(graded)
+    assert all(value is None for value in ungraded.values())
+    assert judge_scores(None) == ungraded
+
+
+def test_the_reported_mean_stays_the_oracle_score_whatever_the_judge_says() -> None:
+    """``task_score`` is imported by ``compare_harness_runs`` precisely so two
+    scorers cannot disagree. Folding the judge into it would silently
+    reinterpret every run already on disk, so the judge is reported beside the
+    completion metric rather than inside it."""
+    from run_harness_bench import task_score
+
+    status = {"state": "complete", "outcome_score": 0.8,
+              "combined_score": 0.4, "process_score": 0.5}
+    assert task_score(status) == 0.8

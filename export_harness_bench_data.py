@@ -82,6 +82,14 @@ SCHEMA: dict[str, dict[str, str]] = {
         # task is not a failure, and must not be averaged as one.
         "attempted": "INTEGER",
         "outcome_score": "REAL", "score": "REAL", "combined_score": "REAL",
+        # NULL across all of these means no judge ran, so process and security
+        # were assumed 1.0 rather than measured and ``combined_score`` is
+        # ``outcome_score``. The three dimensions are kept beside the mean
+        # because the mean cannot say which half of a run was weak.
+        "process_score": "REAL", "security_score": "REAL",
+        "judge_model": "TEXT", "judge_tool_use": "REAL",
+        "judge_consistency": "REAL", "judge_robustness": "REAL",
+        "judge_notes": "TEXT",
         "adapter_ok": "INTEGER",
         "elapsed_sec": "REAL", "model_time_sec": "REAL", "model_calls": "INTEGER",
         # Sum of each call's whole prompt: what the provider bills, NOT the
@@ -591,6 +599,13 @@ def collect_trial(run_dir: Path, run: dict[str, Any], task_id: str,
         "state": status.get("state"), "attempted": attempted,
         "outcome_score": number(status.get("outcome_score")),
         "score": score, "combined_score": number(status.get("combined_score")),
+        "process_score": number(status.get("process_score")),
+        "security_score": number(status.get("security_score")),
+        "judge_model": status.get("judge_model"),
+        "judge_tool_use": number(status.get("judge_tool_use")),
+        "judge_consistency": number(status.get("judge_consistency")),
+        "judge_robustness": number(status.get("judge_robustness")),
+        "judge_notes": status.get("judge_notes"),
         "adapter_ok": status.get("adapter_ok"),
         "elapsed_sec": number(status.get("elapsed_sec")),
         "model_time_sec": round(sum(

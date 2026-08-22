@@ -376,6 +376,30 @@ const SAVED = {
   'task_reliability': 'SELECT * FROM task_reliability ORDER BY mean_score',
   'trials': 'SELECT trial_id, task_id, difficulty, profile, mode, score, elapsed_sec,\n       input_tokens_billed, output_tokens, cost_total_usd, validity_flags\nFROM trials ORDER BY trial_id',
 
+  // -- what the judge saw --------------------------------------------
+  // Empty until a job runs with a judge selected. Without one, process and
+  // security are assumed 1.0 rather than measured, so combined == outcome and
+  // these columns are NULL -- which is the honest reading, not a gap.
+  'judge scores': "SELECT task_id, mode, ROUND(AVG(score),3) AS oracle,
+       ROUND(AVG(process_score),3) AS process,
+       ROUND(AVG(judge_tool_use),3) AS tool_use,
+       ROUND(AVG(judge_consistency),3) AS consistency,
+       ROUND(AVG(judge_robustness),3) AS robustness,
+       ROUND(AVG(combined_score),3) AS combined, COUNT(*) AS trials
+FROM trials WHERE process_score IS NOT NULL
+GROUP BY task_id, mode ORDER BY process",
+  // The gate is coarse by design -- it fires only on severe abuse (mass rm,
+  // escaping the workspace) and defaults to 1. A row here is worth reading;
+  // an empty result is the expected outcome, not a missing measurement.
+  'security gate fired': "SELECT trial_id, task_id, mode, judge_model, security_score, judge_notes
+FROM trials WHERE security_score IS NOT NULL AND security_score < 1",
+  // What the judge cost, and whether it moved the number it was bought for.
+  'judge effect on score': "SELECT judge_model, COUNT(*) AS trials,
+       ROUND(AVG(score),4) AS oracle_only,
+       ROUND(AVG(combined_score),4) AS combined,
+       ROUND(AVG(combined_score)-AVG(score),4) AS delta
+FROM trials WHERE attempted = 1 GROUP BY judge_model",
+
   // -- where the money goes ------------------------------------------
   // Caching makes input nearly free, so cost follows what the model WRITES.
   // Output has been ~7% of tokens and ~46% of spend.

@@ -708,7 +708,13 @@ def run_one_task(*, task_id, task_dir, benchmark, env_file, image, mode, model,
         status["official_result"] = str(official.relative_to(task_dir)).replace("\\", "/")
         payload = read_json(official) or {}
         status["outcome_score"] = ((payload.get("oracle_result") or {}).get("outcome_score"))
-        status["combined_score"] = ((payload.get("scoring") or {}).get("combined_score"))
+        scoring = payload.get("scoring") or {}
+        status["combined_score"] = scoring.get("combined_score")
+        # What the judge said, kept per dimension rather than as the mean it
+        # is reduced to. "Process 0.72" says a run was mediocre; a tool-use of
+        # 0.5 beside a robustness of 1.0 says which half, and those are the
+        # two the kernel's own changes actually move.
+        status.update(judge_scores(scoring))
         status["adapter_ok"] = ((payload.get("adapter_result") or {}).get("ok"))
         status["elapsed_sec"] = payload.get("elapsed_sec")
         if provider_error:
@@ -1043,6 +1049,42 @@ def detect_provider_failure(task_dir: Path) -> str | None:
             line = next((line for line in reversed(text.splitlines()) if pattern in line.casefold()), pattern)
             return line[-1000:]
     return None
+
+
+def judge_scores(scoring: dict[str, Any] | None) -> dict[str, Any]:
+    """Flatten one run's LLM-judge verdict, or a row of ``None``.
+
+    **The keys exist whether or not a judge ran**, because the alternative is
+    a status file whose shape depends on a setting: an absent key reads as
+    "not recorded yet" to everything downstream, while ``None`` reads as "not
+    measured", and only the second is true of a run graded without a judge.
+
+    ``process_effective`` is deliberately not carried. It is 1.0 both when the
+    judge scored a flawless run and when no judge ran at all, so keeping it
+    beside ``process_score`` would put a number that means two things next to
+    one that means one.
+    """
+    scoring = scoring or {}
+    rubric = scoring.get("rubric") if isinstance(scoring.get("rubric"), dict) else {}
+    scores = rubric.get("scores") if isinstance(rubric.get("scores"), dict) else {}
+
+    def number(value):
+        return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+    return {
+        "process_score": number(scoring.get("process_score")),
+        "security_score": number(scoring.get("security_score")),
+        "judge_model": scoring.get("rubric_model"),
+        # The three the process score is the mean of.
+        "judge_tool_use": number(scores.get("tool_use_appropriate")),
+        "judge_consistency": number(scores.get("consistency")
+                                    if scores.get("consistency") is not None
+                                    else scores.get("flow_coherence")),
+        "judge_robustness": number(scores.get("robustness")
+                                   if scores.get("robustness") is not None
+                                   else scores.get("error_handling")),
+        "judge_notes": rubric.get("notes") or scoring.get("notes"),
+    }
 
 
 def task_score(status: dict[str, Any] | None) -> float:

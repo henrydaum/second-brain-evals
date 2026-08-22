@@ -268,6 +268,20 @@ function render(data){
     if(e.kind==='task_result'){
       thinking(false);
       bubble('ok','oracle',`score ${e.status?.outcome_score} / ${e.status?.state}`);
+      // The judge grades each trial as it finishes, not at the end of the
+      // run, so its verdict belongs here beside the oracle's rather than
+      // only in the exported database. Absent when no judge was selected.
+      const st = e.status || {};
+      if(st.process_score != null){
+        bubble('ok','judge',
+          `process ${st.process_score}`
+          + ` (tool ${st.judge_tool_use ?? '-'}`
+          + `, consistency ${st.judge_consistency ?? '-'}`
+          + `, robustness ${st.judge_robustness ?? '-'})`
+          + ` · security ${st.security_score ?? '-'}`
+          + ` · combined ${st.combined_score ?? '-'}`
+          + (st.judge_notes ? ` — ${st.judge_notes}` : ''));
+      }
       continue;
     }
     const f=e.frame||{}, p=f.payload??{};
