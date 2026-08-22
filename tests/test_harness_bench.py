@@ -753,3 +753,67 @@ def test_the_reported_mean_stays_the_oracle_score_whatever_the_judge_says() -> N
     status = {"state": "complete", "outcome_score": 0.8,
               "combined_score": 0.4, "process_score": 0.5}
     assert task_score(status) == 0.8
+
+
+def test_tunnelled_tasks_resolve_to_the_server_their_own_hook_started() -> None:
+    """Five tasks serve a page locally and then want a *public* address for
+    it, via a Cloudflare tunnel. In a sealed container that hook raises before
+    the agent is called, so the task does not score badly -- it never runs.
+
+    Handing the loopback URL back changes the address, not the work: the same
+    bytes are fetched from the same server with the same tools.
+    """
+    import importlib.util
+    import os
+
+    from run_harness_bench import PUBLIC_URL_TEMPLATE, TUNNELLED_TASKS
+
+    local = "http://127.0.0.1:32100"
+    previous = os.environ.get("HARNESSBENCH_PUBLIC_URL_TEMPLATE")
+    os.environ["HARNESSBENCH_PUBLIC_URL_TEMPLATE"] = PUBLIC_URL_TEMPLATE
+    try:
+        for task in sorted(TUNNELLED_TASKS):
+            hooks = DEFAULT_BENCHMARK / "tasks" / task / "hooks.py"
+            assert hooks.is_file(), task
+            spec = importlib.util.spec_from_file_location(
+                "hooks_" + task.replace("-", "_"), hooks)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            url, tunnel = module._start_public_tunnel(local)
+            assert url == local, task
+            # No second process to leak: cleanup_runtime kills by pid, and a
+            # tunnel that was never started has no pid to kill.
+            assert tunnel is None, task
+    finally:
+        if previous is None:
+            os.environ.pop("HARNESSBENCH_PUBLIC_URL_TEMPLATE", None)
+        else:
+            os.environ["HARNESSBENCH_PUBLIC_URL_TEMPLATE"] = previous
+
+
+def test_without_the_override_the_hook_still_refuses() -> None:
+    """The override is the fix, not a happy accident of the environment. If
+    the run ever stops passing it, this must fail loudly again rather than
+    quietly reaching for a live tunnel."""
+    import importlib.util
+    import os
+
+    hooks = DEFAULT_BENCHMARK / "tasks" / "006-access-bilibili" / "hooks.py"
+    spec = importlib.util.spec_from_file_location("hooks_006_bare", hooks)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    previous = os.environ.pop("HARNESSBENCH_PUBLIC_URL_TEMPLATE", None)
+    tunnel_cmd = os.environ.pop("HARNESSBENCH_TUNNEL_CMD", None)
+    try:
+        import shutil as _shutil
+        if _shutil.which("cloudflared"):
+            pytest.skip("cloudflared is installed, so the bare path would tunnel")
+        with pytest.raises(RuntimeError, match="no public mock URL configured"):
+            module._start_public_tunnel("http://127.0.0.1:32100")
+    finally:
+        if previous is not None:
+            os.environ["HARNESSBENCH_PUBLIC_URL_TEMPLATE"] = previous
+        if tunnel_cmd is not None:
+            os.environ["HARNESSBENCH_TUNNEL_CMD"] = tunnel_cmd

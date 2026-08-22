@@ -58,6 +58,34 @@ BENCHMARK_TOOLS = {
     "edit_file", "glob", "grep", "read_file", "run_command", "run_script",
     "schedule_subagent", "spawn_subagent", "sql_query", "validate",
 }
+#: Tasks whose ``prepare_runtime`` hook serves a page or API over HTTP and
+#: then wants a *public* address for it, by way of a Cloudflare tunnel.
+#:
+#: The tunnel is the one place the suite contradicts its own design: the
+#: release is offline and sandboxed precisely to avoid live services, and
+#: these five ask for one anyway. In a sealed container the hook raises before
+#: the agent is ever called, so the task is not scored badly -- it does not
+#: run at all.
+TUNNELLED_TASKS = frozenset({
+    "003-browser",
+    "006-access-bilibili",
+    "078-local-api-cursor-retry-ledger",
+    "081-local-html-dom-form-extract",
+    "088-api-contract-mock-client-compat",
+})
+#: Hand the hook back the loopback URL it already started a server on, instead
+#: of a public one.
+#:
+#: **This changes the address, not the task.** The hook serves the page either
+#: way; the work is to fetch it and extract from what comes back, and a
+#: loopback URL exercises the same tools against the same bytes. Task 006's
+#: oracle only asks that ``out/source_url.txt`` be non-empty and look like a
+#: URL, which a loopback address satisfies.
+#:
+#: Recorded per run for the same reason ``oracle_normalizations`` is: it is a
+#: deviation from how upstream would have run the task, and a number produced
+#: under it should say so.
+PUBLIC_URL_TEMPLATE = "{local_url}"
 CONTAINER_BENCH_ROOT = "/work/harnessbench"
 # run_command deliberately accepts cwd only under Second Brain's application
 # or data roots. Keeping official task sandboxes in the agent data workspace
@@ -140,6 +168,16 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
     tasks = choose_tasks(options, metadata["tasks"])
+
+    # A task the mode cannot complete is not a measurement of the mode, it is
+    # a zero with a plausible-looking cause. Said before the run rather than
+    # discovered in the mean afterwards.
+    if options.mode == "lockdown" and (blocked := sorted(set(tasks) & TUNNELLED_TASKS)):
+        print(f"warning: {len(blocked)} task(s) in this selection fetch over HTTP, "
+              "which lockdown denies: " + ", ".join(blocked), file=sys.stderr)
+        print("         They will score near zero for the mode rather than for "
+              "the agent. Drop them with --exclude to keep the mean readable.",
+              file=sys.stderr)
 
     # Checked before the task list is even priced: a stale image is cheapest
     # to notice now, and most expensive to notice after a full suite has run
@@ -616,6 +654,11 @@ def open_run(options, tasks, model, metadata, image_id):
         "process_grade": ("skipped" if getattr(options, "judge", "none") == "none"
                           else f"llm judge: {options.judge}"),
         "oracle_quality_llm": "skipped",
+        # The tunnelled tasks in this selection were pointed at the loopback
+        # server their own hook started, rather than at a public Cloudflare
+        # address. Empty when the selection contains none of them.
+        "localhost_mock_tasks": sorted(set(tasks) & TUNNELLED_TASKS),
+        "public_url_template": PUBLIC_URL_TEMPLATE,
         # Scoring deviations from the pinned release, recorded so a comparison
         # can tell whether two numbers were produced the same way. A task
         # listed here is comparable with another run of *this* harness and not
@@ -659,6 +702,9 @@ def run_one_task(*, task_id, task_dir, benchmark, env_file, image, mode, model,
                 # its weight is 0 for every task except the two vision ones, so
                 # enabling it buys nothing here and costs a call per trial.
                 "-e", "HARNESSBENCH_SKIP_ORACLE_QUALITY_LLM=1",
+                # Keeps the tunnelled tasks inside the container. Harmless to
+                # every other task, whose hooks never read it.
+                "-e", f"HARNESSBENCH_PUBLIC_URL_TEMPLATE={PUBLIC_URL_TEMPLATE}",
                 *judge_env(judge),
                 container,
                 # The judge's key is read from the container's own environment
