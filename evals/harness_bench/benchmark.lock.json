@@ -1,6 +1,7 @@
 {
   "repository": "https://github.com/Qihoo360/harness-bench.git",
-  "commit": "1025086a446653702b80cfb48babbeec35db6b2c",
+  "commit": "2274ee055f58a3342e82547eaf5ce7fa634707ca",
   "task_count": 106,
-  "note": "Upstream had no repository license at this revision; keep it as an external checkout rather than vendoring it."
+  "note": "Upstream had no repository license at this revision; keep it as an external checkout rather than vendoring it. Local patch on top of upstream: 028 oracle accepts a string-entry timeline (see upstream_commit for the unmodified base).",
+  "upstream_commit": "1025086a446653702b80cfb48babbeec35db6b2c"
 }
