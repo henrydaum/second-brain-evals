@@ -113,14 +113,19 @@ def configure() -> None:
     config["secret_http_token"] = token
     config["http_port"] = int(os.environ.get("SB_HTTP_PORT", "8787"))
 
-    key = os.environ.get("SB_LLM_API_KEY")
+    # Which variable holds this run's key. The launcher passes the *name*
+    # (from models.json ``api_key_env``) rather than the value, so the secret
+    # arrives through --env-file and never appears in a docker argument list.
+    # Defaults to SB_LLM_API_KEY, which is what a single-provider run uses.
+    key_var = os.environ.get("SB_LLM_API_KEY_VAR") or "SB_LLM_API_KEY"
+    key = os.environ.get(key_var)
     model = os.environ.get("SB_LLM_MODEL")
     endpoint = os.environ.get("SB_LLM_ENDPOINT")
     if not all((key, model, endpoint)):
         missing = [
             name
             for name, value in (
-                ("SB_LLM_API_KEY", key),
+                (key_var, key),
                 ("SB_LLM_MODEL", model),
                 ("SB_LLM_ENDPOINT", endpoint),
             )

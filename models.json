@@ -19,9 +19,106 @@
   ],
   "pricing_version": "2026-08-20b",
   "models": {
+    "anthropic/claude-sonnet-4-6": {
+      "endpoint": "https://api.anthropic.com/v1",
+      "backend": "LiteLLMService",
+      "api_model": "claude-sonnet-4-6",
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "context_size": 0,
+      "pricing": {
+        "input_usd_per_mtok": 3.0,
+        "cached_input_usd_per_mtok": 0.3,
+        "output_usd_per_mtok": 15.0
+      },
+      "pricing_as_of": "2026-08-23",
+      "pricing_source": "https://platform.claude.com/docs/en/pricing",
+      "pricing_notes": [
+        "First-party Anthropic API rates. Cache reads are 0.1x input; cache",
+        "WRITES are 1.25x input and this file has no field for them, so a run",
+        "that writes a lot of fresh cache is under-costed here. Harmless for",
+        "the judge, which shares almost no prefix between trials and caches",
+        "nothing; revisit before pricing Claude as the AGENT model.",
+        "The endpoint is Anthropic's OpenAI-compatible layer, which is what",
+        "the grader speaks: it POSTs to {endpoint}/chat/completions with",
+        "Authorization: Bearer. That layer does NOT support prompt caching at",
+        "all, so cached_input_usd_per_mtok is unreachable through it -- it is",
+        "recorded for the native path, and for the judge it never applies."
+      ]
+    },
+    "deepseek-ai/deepseek-v4-flash": {
+      "endpoint": "https://api.atlascloud.ai/v1",
+      "backend": "LiteLLMService",
+      "api_model": "deepseek-ai/deepseek-v4-flash",
+      "api_key_env": "ATLAS_API_KEY",
+      "context_size": 0,
+      "pricing": {
+        "input_usd_per_mtok": 0.14,
+        "cached_input_usd_per_mtok": 0.028,
+        "output_usd_per_mtok": 0.28
+      },
+      "pricing_as_of": "2026-08-23",
+      "pricing_source": "Atlas Cloud listed rates",
+      "pricing_notes": [
+        "The map key IS the model string sent to the endpoint, and its first",
+        "segment must NOT be a provider LiteLLM already recognises -- 'deepseek/'",
+        "made LiteLLM call DeepSeek's own API and ignore Atlas entirely",
+        "(400 'not found'). 'deepseek-ai' is not a known prefix, so the request",
+        "takes the OpenAI-compatible path against the Atlas base URL.",
+        "Atlas quotes input/output only. cached_input is null, so the exporter",
+        "bills cached tokens at the full input rate rather than inventing a"
+      ]
+    },
+    "qwen/qwen3.6-plus": {
+      "endpoint": "https://api.atlascloud.ai/v1",
+      "backend": "LiteLLMService",
+      "api_model": "qwen/qwen3.6-plus",
+      "api_key_env": "ATLAS_API_KEY",
+      "context_size": 0,
+      "pricing": {
+        "input_usd_per_mtok": 0.3255,
+        "cached_input_usd_per_mtok": 0.032,
+        "output_usd_per_mtok": 1.95
+      },
+      "pricing_as_of": "2026-08-23",
+      "pricing_source": "Atlas Cloud listed rates",
+      "pricing_notes": [
+        "The map key IS the model string sent to the endpoint, and its first",
+        "segment must NOT be a provider LiteLLM already recognises -- 'qwen/'",
+        "made LiteLLM call Qwen's own API and ignore Atlas entirely",
+        "(400 'not found'). 'qwen-ai' is not a known prefix, so the request",
+        "takes the OpenAI-compatible path against the Atlas base URL.",
+        "Atlas quotes input/output only. cached_input is null, so the exporter",
+        "bills cached tokens at the full input rate rather than inventing a"
+      ]
+    },
+    "moonshotai/kimi-k2.5": {
+      "endpoint": "https://api.atlascloud.ai/v1",
+      "backend": "LiteLLMService",
+      "api_model": "moonshotai/kimi-k2.5",
+      "api_key_env": "ATLAS_API_KEY",
+      "context_size": 0,
+      "pricing": {
+        "input_usd_per_mtok": 0.49,
+        "cached_input_usd_per_mtok": 0.2,
+        "output_usd_per_mtok": 2.5
+      },
+      "pricing_as_of": "2026-08-23",
+      "pricing_source": "Atlas Cloud listed rates",
+      "pricing_notes": [
+        "The map key IS the model string sent to the endpoint, and its first",
+        "segment must NOT be a provider LiteLLM already recognises -- 'moonshot/'",
+        "made LiteLLM call Moonshot's own API and ignore Atlas entirely",
+        "(400 'not found'). 'moonshotai' is not a known prefix, so the request",
+        "takes the OpenAI-compatible path against the Atlas base URL.",
+        "Atlas quotes input/output only. cached_input is null, so the exporter",
+        "bills cached tokens at the full input rate rather than inventing a"
+      ]
+    },
     "minimax/MiniMax-M3": {
       "endpoint": "https://api.minimax.io/v1",
       "backend": "LiteLLMService",
+      "api_model": "minimax/MiniMax-M3",
+      "api_key_env": "MINIMAX_API_KEY",
       "context_size": 0,
       "pricing": {
         "input_usd_per_mtok": 0.3,

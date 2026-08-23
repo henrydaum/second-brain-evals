@@ -236,6 +236,16 @@ def main(argv: list[str] | None = None) -> int:
         "SB_PROFILE": options.profile,
         "SB_ADD_PACKAGES": ",".join(PROFILES[options.profile].get("add") or []),
         "SB_REMOVE_PACKAGES": ",".join(PROFILES[options.profile].get("remove") or []),
+        # The **name** of the variable holding this model's key, never the key.
+        # Values here become ``docker -e`` arguments and would land in a
+        # process list; the key itself rides in through ``--env-file`` and is
+        # resolved by name inside the container.
+        #
+        # ``api_key_env`` used to be read only by the judge, so a model that
+        # named one still had its agent authenticate with SB_LLM_API_KEY --
+        # which reads as "why is there an SB key at all" the moment a run
+        # names two providers.
+        "SB_LLM_API_KEY_VAR": spec.get("api_key_env") or "SB_LLM_API_KEY",
     }
     if spec.get("context_size"):
         env_overrides["SB_LLM_CONTEXT"] = str(spec["context_size"])
@@ -250,6 +260,11 @@ def main(argv: list[str] | None = None) -> int:
     # whatever the env file happened to name.
     preflight_values = dict(env_values)
     preflight_values.update({k: v for k, v in env_overrides.items() if v})
+    # Host-side check, so the key is resolved here rather than by name. In
+    # process only -- it never reaches a command line.
+    key_var = env_overrides["SB_LLM_API_KEY_VAR"]
+    preflight_values["SB_LLM_API_KEY"] = env_values.get(key_var, "")
+    preflight_values["SB_LLM_API_KEY_NAME"] = key_var
     if not options.skip_provider_check:
         try:
             provider_preflight(model, preflight_values)
@@ -912,7 +927,12 @@ def run_one_task(*, task_id, task_dir, benchmark, env_file, image, mode, model,
                 # rather than passed on this command line, so it never reaches
                 # a process list or a harness log.
                 "sh", "-c",
-                'RUBRIC_API_KEY="${RUBRIC_API_KEY:-$SB_LLM_API_KEY}" '
+                # Indirect expansion: ``RUBRIC_KEY_VAR`` names the variable to
+                # read, and the value is fetched from the container's own
+                # environment. Falls back to the run's own key when the judge
+                # shares the agent's provider.
+                'eval "RUBRIC_API_KEY=\\${${RUBRIC_KEY_VAR:-SB_LLM_API_KEY}}"; '
+                "export RUBRIC_API_KEY; "
                 "exec python -m harnessbench.cli run-task "
                 f"--task {shlex.quote(task_id)} --harness second-brain --mode live",
             ]
@@ -1103,8 +1123,15 @@ def judge_env(judge: str | None) -> list[str]:
     # A judge on a different provider needs its own key. Naming the variable
     # in models.json keeps that a data change rather than a code change; the
     # container falls back to the run's own key when nothing is named.
+    #
+    # The **name** travels, never the value. Emitting ``RUBRIC_API_KEY=$NAME``
+    # looked like it would work and does not: ``docker -e`` performs no
+    # expansion, and the receiving shell expands its own variable exactly once,
+    # so the grader was handed the literal text ``$ANTHROPIC_API_KEY`` and
+    # authenticated with that. It went unnoticed because the only judge used so
+    # far names no variable and falls through to the run's own key.
     if spec.get("api_key_env"):
-        flags += ["-e", f"RUBRIC_API_KEY=${{{spec['api_key_env']}}}"]
+        flags += ["-e", f"RUBRIC_KEY_VAR={spec['api_key_env']}"]
     return flags
 
 
@@ -1489,14 +1516,49 @@ def print_summary(summary: dict[str, Any]) -> None:
     print(f"  completed: {summary.get('completed')}  harness errors: {summary.get('harness_errors')}  provider unavailable: {summary.get('provider_unavailable')}")
 
 
+#: Providers LiteLLM addresses by prefix. Mirrors ``_KNOWN_PROVIDER_PREFIXES``
+#: in the store's ``llm/llm_litellm.py``, which is the source of truth; this
+#: copy exists because the store is a different branch and cannot be imported
+#: from here. A name outside this set, paired with a custom base URL, is
+#: assumed OpenAI-compatible.
+LITELLM_PROVIDER_PREFIXES = frozenset({
+    "anthropic", "azure", "bedrock", "cohere", "deepseek", "gemini", "groq",
+    "minimax", "mistral", "ollama", "openai", "openrouter", "vertex_ai", "xai",
+})
+
+
+def litellm_route(model: str, base_url: str) -> str:
+    """What the container will actually call this model, given its endpoint.
+
+    The preflight exists to test *the endpoint the containers will use*, and
+    for that it has to ask for the model the same way they will. Sending the
+    bare name instead tested a different route than the run: a name LiteLLM
+    recognises as a provider (``deepseek/...``) went to that provider's own
+    API and never touched the configured base URL, so an Atlas-hosted model
+    failed preflight with ``DeepseekException 400 not found`` while a
+    misrouted one could just as easily have passed.
+    """
+    provider = model.split("/", 1)[0].lower().replace("-", "_") if "/" in model else ""
+    if base_url and provider not in LITELLM_PROVIDER_PREFIXES:
+        return f"openai/{model}"
+    return model
+
+
 def provider_preflight(model: str, values: dict[str, str]) -> None:
     key = values.get("SB_LLM_API_KEY")
     endpoint = values.get("SB_LLM_ENDPOINT")
+    # Name the variable the env file was actually searched for. "missing
+    # SB_LLM_API_KEY" sent someone looking for a setting that does not exist
+    # when the model names its own key through ``api_key_env``.
+    key_name = values.get("SB_LLM_API_KEY_NAME") or "SB_LLM_API_KEY"
     missing = [name for name, value in (
-        ("SB_LLM_API_KEY", key), ("SB_LLM_ENDPOINT", endpoint)
+        (key_name, key), ("SB_LLM_ENDPOINT", endpoint)
     ) if not value]
     if missing:
-        raise RuntimeError("provider preflight is missing " + ", ".join(missing))
+        raise RuntimeError(
+            f"provider preflight is missing {', '.join(missing)} in the env "
+            f"file. {model!r} reads its key from {key_name!r} "
+            "(models.json: api_key_env).")
     try:
         import litellm
 
@@ -1504,7 +1566,7 @@ def provider_preflight(model: str, values: dict[str, str]) -> None:
         litellm.telemetry = False
         litellm.suppress_debug_info = True
         litellm.completion(
-            model=model,
+            model=litellm_route(model, endpoint),
             messages=[{"role": "user", "content": "Reply OK."}],
             api_key=key,
             api_base=endpoint,
