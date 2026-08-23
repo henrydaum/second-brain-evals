@@ -157,6 +157,23 @@ def configure() -> None:
     config["fs_writable_dirs"] = writable
     config_manager.save(config)
 
+    # Where run_command starts before the model has said where to work. The
+    # value is a *pointer file*, not a directory: the task sandbox is created
+    # by the benchmark long after this container booted, so its path cannot be
+    # known here. ``drive_round`` writes the workspace into that file for each
+    # task, and the tool reads it on the session's first command.
+    #
+    # A plugin setting rather than a core one, because the setting belongs to
+    # run_command and is declared by it (``config_settings``). Writing it here
+    # keeps the eval harness from having to teach the agent, every task, a
+    # thing the environment already knows.
+    pointer = os.environ.get("SB_INITIAL_CWD_FILE", "/work/live/cwd")
+    if pointer:
+        Path(pointer).parent.mkdir(parents=True, exist_ok=True)
+        plugin_config = config_manager.load_plugin_config()
+        plugin_config["initial_working_directory"] = pointer
+        config_manager.save_plugin_config(plugin_config)
+
     print(
         "[eval-entrypoint] "
         f"model={model} frontends=http writable={','.join(writable)}",

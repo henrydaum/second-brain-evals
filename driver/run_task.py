@@ -25,7 +25,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from driver import collect, proxy_trace, turn           # noqa: E402
+from driver import collect, integrity, proxy_trace, turn  # noqa: E402
 from driver.approver import Approver, Manifest          # noqa: E402
 from driver.wire import Client                          # noqa: E402
 
@@ -88,11 +88,20 @@ def main(argv=None):
     approver.start()
 
     budget = spec.get("budget") or {}
+    # Hashed before the agent is given the prompt, so "as the task supplied
+    # it" means exactly that. Cheap: one walk of a sandbox that is a few MB.
+    guard = dict(spec.get("integrity") or {})
+    watch = bool(guard.get("watch", True))
+    supplied = integrity.baseline(workdir) if watch else {}
+
     _stamped("[task] " + str(spec.get("id")) + " -> " + workdir)
     outcome = turn.run_turn(client, spec["prompt"],
                             wall_s=float(budget.get("wall_s", 900)),
                             stall_s=float(budget.get("stall_s", 300)),
                             approver=approver, log=_stamped)
+
+    integrity_report = _guard_inputs(client, workdir, supplied, guard, budget,
+                                     approver, outcome) if watch else None
     approver.stop()
 
     cid = session.get("conversation_id") or collect.conversation_id(client)
@@ -114,6 +123,10 @@ def main(argv=None):
         "wall_s": round(time.time() - started, 3),
         "stream": client.stream_state,
         "security_mode": requested_mode,
+        # Whether the agent rewrote what the task handed it. Reported whether
+        # or not the correction turn was enabled, because the measurement is
+        # the point and the intervention is an experiment on top of it.
+        "input_integrity": integrity_report,
         "setup_approvals": setup_approver.decisions,
         # ``/mode yolo`` is gated by ``ModeCommand.approval_actions`` and its
         # dialog carries no ``detail``, so it arrives as a *question* rather
@@ -150,6 +163,88 @@ def main(argv=None):
              + str(numbers["approvals"]) + " approvals, "
              + str(numbers["tool_calls"]) + " tool calls")
     return 0
+
+
+def _guard_inputs(client, workdir, supplied, guard, budget, approver, outcome):
+    """Compare the workspace against what the task supplied, and optionally say so.
+
+    Returns the record either way. ``correct`` off makes this a pure
+    measurement, which is how the intervention gets an honest baseline to be
+    compared against: the same number, collected identically, with and without
+    the extra turn.
+
+    The correction turn is skipped when the first turn did not finish
+    cleanly. An agent that hit its wall clock has no budget left to restore
+    anything, and submitting into a turn that is still unwinding buys a
+    second timeout rather than a repair.
+    """
+    if not supplied:
+        return None
+    report = integrity.drift(supplied, workdir)
+    record = {"before": integrity.summarize(report), "corrected": False,
+              "committed_nothing": integrity.committed_nothing(report)}
+
+    # Two different failures share this one walk of the workspace. Nothing
+    # committed is checked first because it is the expensive one: a trial that
+    # wrote no file has usually scored near zero, where a rewritten input
+    # costs a fraction of one check.
+    if record["committed_nothing"]:
+        _stamped("[integrity] turn ended with no new files in the workspace")
+        if guard.get("commit") and outcome.get("ok"):
+            record.update(_nudge(client, workdir, supplied, guard, budget,
+                                 approver, integrity.COMMITMENT_PROMPT,
+                                 "commitment"))
+            report = integrity.drift(supplied, workdir)
+            record["before"] = integrity.summarize(report)
+            record["committed_nothing"] = integrity.committed_nothing(report)
+
+    if not integrity.violated(report):
+        _stamped("[integrity] workspace inputs intact")
+        return record
+
+    names = ", ".join((report["modified"] + report["deleted"])[:6])
+    _stamped(f"[integrity] {len(report['modified'])} modified, "
+             f"{len(report['deleted'])} deleted: {names}")
+    if not guard.get("correct"):
+        return record
+    if not outcome.get("ok"):
+        record["skipped"] = "first turn did not finish cleanly: " + str(
+            outcome.get("reason"))
+        return record
+
+    _stamped("[integrity] offering the agent a chance to restore them")
+    record.update(_nudge(client, workdir, supplied, guard, budget, approver,
+                         integrity.correction_prompt(report), "correction"))
+    after = integrity.drift(supplied, workdir)
+    record.update({
+        "corrected": True,
+        "after": integrity.summarize(after),
+        "restored": sorted(
+            set(report["modified"] + report["deleted"])
+            - set(after["modified"] + after["deleted"])),
+    })
+    _stamped(f"[integrity] restored {len(record['restored'])} of "
+             f"{len(report['modified']) + len(report['deleted'])}")
+    return record
+
+
+def _nudge(client, workdir, supplied, guard, budget, approver, prompt, label):
+    """One extra turn, and the record of what it cost and whether it helped.
+
+    Capped well below the task budget: an agent that needs ten more minutes
+    here was not one turn away from finishing, and the cap is what keeps a
+    nudge from turning a cheap trial into an expensive one.
+    """
+    result = turn.run_turn(
+        client, prompt,
+        wall_s=float(guard.get("wall_s", min(240.0, float(budget.get("wall_s", 900))))),
+        stall_s=float(budget.get("stall_s", 300)),
+        approver=approver, log=_stamped)
+    _stamped(f"[integrity] {label} turn: {result.get('reason')} in "
+             f"{result.get('elapsed_s')}s")
+    return {f"{label}_outcome": {"ok": result.get("ok"),
+                                 "reason": result.get("reason"),
+                                 "elapsed_s": result.get("elapsed_s")}}
 
 
 def _template_manifest():

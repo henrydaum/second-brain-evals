@@ -132,7 +132,16 @@ def test_corpus_audit_proves_this_is_not_a_large_knowledgebase_benchmark() -> No
 
     assert report["tasks"] == 106
     assert report["fixture_files"] == 508
-    assert report["fixture_bytes"] == 388123
+    # 382298, not the 388123 this asserted until 2026-08-23. The checkout had
+    # been cloned under Git's Windows default ``core.autocrlf=true``, so 1560
+    # of its 2058 files carried CRLF that the LF blobs do not, and the extra
+    # 5825 bytes are those carriage returns. They rode into every container
+    # through ``stage_benchmark``'s copytree and broke every oracle that
+    # hashes a fixture -- 23 integrity checks failed in the first full run for
+    # no reason but this. The file count is unchanged because nothing was
+    # added or lost, only re-encoded. If this number climbs back, the checkout
+    # has been re-cloned without ``core.autocrlf=false``.
+    assert report["fixture_bytes"] == 382298
     assert report["largest_non_media_task"]["non_media_bytes"] < 13_000
     assert report["tasks_with_hooks"] == 28
     assert len(report["local_http_tasks"]) == 7

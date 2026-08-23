@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import posixpath
@@ -146,6 +147,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--resume", metavar="RUN_DIR")
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--keep-container", action="store_true")
+    parser.add_argument(
+        "--integrity-correct", action="store_true",
+        help="after the task turn, tell the agent which supplied files it "
+             "changed and let it restore them (measurement is always on)")
+    parser.add_argument(
+        "--commit-nudge", action="store_true",
+        help="when a turn ends having created no file at all, say so once and "
+             "let the agent write its deliverables (measurement is always on)")
     options = parser.parse_args(argv)
 
     benchmark = Path(options.benchmark_root).resolve()
@@ -222,6 +231,13 @@ def main(argv: list[str] | None = None) -> int:
     }
     if spec.get("context_size"):
         env_overrides["SB_LLM_CONTEXT"] = str(spec["context_size"])
+    # The driver always hashes the workspace before and after the turn; this
+    # only decides whether the agent is *told* what it changed. Off by default
+    # so the guard can be measured against a baseline collected the same way.
+    if options.integrity_correct:
+        env_overrides["SB_INTEGRITY_CORRECT"] = "1"
+    if options.commit_nudge:
+        env_overrides["SB_COMMIT_NUDGE"] = "1"
     # Preflight has to test the endpoint the containers will actually use, not
     # whatever the env file happened to name.
     preflight_values = dict(env_values)
@@ -297,6 +313,53 @@ def main(argv: list[str] | None = None) -> int:
     return exit_code
 
 
+def assert_fixture_bytes_canonical(root: Path) -> None:
+    """Hash the fixtures the oracles hash, and refuse a run that would lie.
+
+    The ``core.autocrlf`` check above tests a *setting*, and a setting is not
+    the tree. This checkout passed it for three days while every fixture on
+    disk still carried the CRLF of a clone made before the setting was
+    written: ``git status`` stayed clean because the index stat cache was
+    never invalidated, so nothing re-read the content. ``schema_data.sql`` was
+    1914 bytes against a 1841-byte blob, ``stage_benchmark`` copied the
+    working tree into every container, and the first full 106-task run
+    reported 23 integrity violations that never happened.
+
+    So this checks bytes. ``ground_truth.json`` already publishes the digests
+    the oracles will compare against, which makes them free to verify here and
+    exact by construction -- a fixture that fails this would have failed its
+    own task's integrity check for reasons the agent had no part in.
+    """
+    mismatched: list[str] = []
+    checked = 0
+    for manifest in sorted((root / "tasks").glob("*/ground_truth.json")):
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for relative, digest in (data.get("fixture_hashes") or {}).items():
+            fixture = manifest.parent / "fixtures" / "in" / relative
+            if not fixture.is_file():
+                # Absent is this task's own business: several declare hashes
+                # for files their hooks generate at setup time.
+                continue
+            checked += 1
+            if hashlib.sha256(fixture.read_bytes()).hexdigest() != digest:
+                mismatched.append(f"{manifest.parent.name}/{relative}")
+    if mismatched:
+        raise RuntimeError(
+            f"{len(mismatched)} of {checked} fixtures do not match the digests "
+            "their own ground_truth.json publishes, so every oracle that hashes "
+            "one will report a violation the agent did not commit. This is what "
+            "a CRLF-converted checkout looks like. Repair it with:\n"
+            "    git -C " + str(root) + " config core.autocrlf false\n"
+            "    git -C " + str(root) + " rm --cached -r -q .\n"
+            "    git -C " + str(root) + " reset --hard -q HEAD\n"
+            "Mismatched: " + ", ".join(sorted(mismatched)[:8])
+            + ("..." if len(mismatched) > 8 else "")
+        )
+
+
 def validate_benchmark(root: Path) -> dict[str, Any]:
     required = (root / "src" / "harnessbench", root / "tasks", root / "grading")
     missing = [str(path) for path in required if not path.exists()]
@@ -322,6 +385,7 @@ def validate_benchmark(root: Path) -> dict[str, Any]:
             "Its fixture oracles hash canonical bytes, so CRLF conversion creates false integrity failures. "
             "Run --fetch-benchmark to repair the ignored benchmark checkout."
         )
+    assert_fixture_bytes_canonical(root)
     tasks: dict[str, dict[str, Any]] = {}
     for manifest in sorted((root / "tasks").glob("*/task.yaml")):
         data = yaml.safe_load(manifest.read_text(encoding="utf-8")) or {}
@@ -666,6 +730,11 @@ def open_run(options, tasks, model, metadata, image_id):
         "oracle_normalizations": sorted(
             task_id for task_id in tasks if task_id in ORACLE_GROUND_TRUTH_REWRITES),
         "reported_metric": "Harness-Bench deterministic completion",
+        # Whether the agent was told, mid-run, which supplied files it had
+        # rewritten. It changes what the agent does, so two runs that differ
+        # here are not replicates of each other.
+        "integrity_guard": "correct" if getattr(options, "integrity_correct", False) else "watch",
+        "commit_nudge": bool(getattr(options, "commit_nudge", False)),
     }
     return run_dir, run
 
@@ -698,6 +767,17 @@ def run_one_task(*, task_id, task_dir, benchmark, env_file, image, mode, model,
                 "-e", "PYTHONUTF8=1",
                 "-e", "HARNESSBENCH_APP_CONFIG=/work/harnessbench/config/app.json",
                 "-e", "HARNESSBENCH_HARNESS_CONFIG=/work/harnessbench/config/harness.json",
+                # The scorer runs as root (``-u 0``) while the agent's sandbox
+                # is written as uid 1000, so every ``git`` the oracle runs
+                # against a task workspace dies on "detected dubious
+                # ownership" and the trial scores 0 for a grader failure the
+                # agent had no part in. 009-git-pr-merge lost its whole score
+                # to this in the first full run. Passed as config env rather
+                # than baked into the image so no rebuild is needed and the
+                # relaxation stays scoped to this exec.
+                "-e", "GIT_CONFIG_COUNT=1",
+                "-e", "GIT_CONFIG_KEY_0=safe.directory",
+                "-e", "GIT_CONFIG_VALUE_0=*",
                 # The oracle-quality LLM stays off whatever the judge setting:
                 # its weight is 0 for every task except the two vision ones, so
                 # enabling it buys nothing here and costs a call per trial.
@@ -960,6 +1040,30 @@ def protect_benchmark_assets(container: str) -> None:
     protected = docker("exec", "-u", "0", container, "chmod", "-R", "go-rwx", *targets)
     if protected.returncode:
         raise RuntimeError("could not protect benchmark oracle assets: " + protected.stderr)
+    # ...but not so protected that the agent cannot read its own inputs.
+    #
+    # Three tasks inject workspace files at runtime with ``shutil.copy2``,
+    # which preserves the source mode. Run from the root scorer against a tree
+    # this function has just made root-only, that lands **unreadable files in
+    # the agent's own ``in/`` directory**. 061-periodic-status-rollup scored a
+    # flat 0.0 because five of its status updates arrived that way, and
+    # 104-async-ops-window-rollup burned 152 tool calls and $0.54 -- 14% of
+    # the whole run's cost -- trying `sudo`, `su`, `runuser` and /proc
+    # spelunking to get at six ops updates it was supposed to just read.
+    #
+    # Directories keep ``go-rwx``, so nothing here is reachable by traversal
+    # and a task's delayed fixtures still cannot be peeked at ahead of their
+    # injection. Only the file bits are relaxed, and only so that a copy *out*
+    # of this tree is readable by the uid that has to consume it. Verified
+    # both ways: injected copies readable, sources and ground_truth.json not.
+    readable = docker(
+        "exec", "-u", "0", container,
+        "find", f"{CONTAINER_BENCH_ROOT}/tasks", "-type", "f",
+        "-exec", "chmod", "go+r", "{}", "+")
+    if readable.returncode:
+        raise RuntimeError(
+            "could not make task fixture bytes copyable to the agent: "
+            + readable.stderr)
     # Node is an oracle dependency, not a bundled agent capability. The root
     # scorer can execute it; Second Brain (UID 1000) cannot and remains free to
     # install a workspace-local runtime using its own tools.

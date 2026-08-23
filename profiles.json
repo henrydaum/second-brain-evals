@@ -28,9 +28,9 @@
   },
   "runtime": {
     "bench": {
-      "description": "Essentials minus interactive-only pieces and web search. Several tasks forbid internet search outright, so offering the tool only manufactures a violation for the oracle to punish.",
+      "description": "Essentials minus interactive-only pieces, web search, and two tools nothing calls. Several tasks forbid internet search outright, so offering it only manufactures a violation for the oracle to punish. sql_query drew 1 call across 307 trials and it failed; schedule_subagent drew none at all. Between them they occupy roughly 724 prompt tokens in every request of every call -- about 1.2M tokens over a 106-task run -- to sit unused.",
       "add": [],
-      "remove": ["tool_web_search"]
+      "remove": ["tool_web_search", "tool_sql_query", "tool_schedule_subagent"]
     },
     "bench-full": {
       "description": "The seed exactly as built, web search included. Kept so a run can be reproduced against the tool set used before search was withdrawn.",

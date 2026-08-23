@@ -111,6 +111,8 @@ SCHEMA: dict[str, dict[str, str]] = {
         "approvals": "INTEGER", "approvals_denied": "INTEGER",
         "questions_asked": "INTEGER",
         "input_integrity": "TEXT", "validity_flags": "TEXT",
+        "inputs_modified": "INTEGER", "inputs_deleted": "INTEGER",
+        "inputs_restored": "INTEGER", "integrity_guard": "TEXT",
         "message_count": "INTEGER", "round_count": "INTEGER",
         "tool_names_json": "TEXT",
         "transcript_path": "TEXT", "events_path": "TEXT",
@@ -497,6 +499,13 @@ def collect_trial(run_dir: Path, run: dict[str, Any], task_id: str,
     # record that the requested security mode was actually granted.
     approvals = denied = questions = 0
     granted_mode = None
+    # The driver's own answer to the question the oracle's ``fixture_integrity``
+    # check answers separately. Kept distinct from ``input_integrity`` above,
+    # which is the *oracle's* verdict: holding both lets a run say whether the
+    # driver's detector sees everything the graders see, and it is the only
+    # signal available on the tasks that ship no integrity check at all.
+    inputs_modified = inputs_deleted = inputs_restored = 0
+    integrity_guard = None
     for round_number, bundle in driver_bundles(task_dir):
         result = read_json(bundle / "result.json") or {}
         metrics = result.get("metrics") or {}
@@ -505,6 +514,15 @@ def collect_trial(run_dir: Path, run: dict[str, Any], task_id: str,
         approvals += int(metrics.get("approvals") or 0)
         denied += int(metrics.get("approvals_denied") or 0)
         questions += int(metrics.get("questions_asked") or 0)
+        if (guard := result.get("input_integrity")) is not None:
+            # After the correction turn where there was one, so the number is
+            # what the oracle actually graded rather than the high-water mark.
+            final = guard.get("after") or guard.get("before") or {}
+            inputs_modified += int(final.get("modified_count") or 0)
+            inputs_deleted += int(final.get("deleted_count") or 0)
+            inputs_restored += len(guard.get("restored") or [])
+            integrity_guard = "correct" if guard.get("corrected") else (
+                integrity_guard or "watch")
         out["driver_rounds"].append({
             "trial_id": trial_id, "round": round_number, "ok": outcome.get("ok"),
             "reason": outcome.get("reason"), "wall_s": number(result.get("wall_s")),
@@ -632,6 +650,8 @@ def collect_trial(run_dir: Path, run: dict[str, Any], task_id: str,
         "approvals": approvals, "approvals_denied": denied,
         "questions_asked": questions,
         "input_integrity": integrity, "validity_flags": ";".join(flags),
+        "inputs_modified": inputs_modified, "inputs_deleted": inputs_deleted,
+        "inputs_restored": inputs_restored, "integrity_guard": integrity_guard,
         "message_count": len(out["messages"]),
         "round_count": len(out["driver_rounds"]),
         "tool_names_json": json_cell(effective.get("tool_names")) if effective else None,
