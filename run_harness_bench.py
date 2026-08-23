@@ -23,6 +23,7 @@ import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -148,6 +149,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--keep-container", action="store_true")
     parser.add_argument(
+        "--concurrency", type=int, default=1, metavar="N",
+        help="run N tasks at once (default 1). Each task is its own container "
+             "at roughly 240MB idle, and the work is almost all waiting on the "
+             "model, so the ceiling is the provider's rate limit rather than "
+             "this machine. Above 1 the live token stream is suppressed, "
+             "because N interleaved streams are unreadable.")
+    parser.add_argument(
         "--integrity-correct", action="store_true",
         help="after the task turn, tell the agent which supplied files it "
              "changed and let it restore them (measurement is always on)")
@@ -257,6 +265,7 @@ def main(argv: list[str] | None = None) -> int:
     write_json(run_dir / "run.json", run)
 
     exit_code = 0
+    pending: list[tuple[int, str]] = []
     for index, task_id in enumerate(tasks, 1):
         task_dir = run_dir / "tasks" / task_id
         previous = read_json(task_dir / "status.json") or {}
@@ -266,6 +275,16 @@ def main(argv: list[str] | None = None) -> int:
         if previous and not options.retry_failed and previous.get("state") not in ("pending", "interrupted"):
             print(f"[{index}/{len(tasks)}] {task_id}: {previous.get('state')} (use --retry-failed)")
             continue
+        pending.append((index, task_id))
+
+    if options.concurrency > 1 and len(pending) > 1:
+        return finish_run(run_dir, tasks, run_tasks_in_parallel(
+            pending, tasks=tasks, run_dir=run_dir, benchmark=benchmark,
+            env_file=env_file, options=options, model=model,
+            env_overrides=env_overrides, judge=run.get("judge")))
+
+    for index, task_id in pending:
+        task_dir = run_dir / "tasks" / task_id
         try:
             result = run_one_task(
                 task_id=task_id,
@@ -308,8 +327,108 @@ def main(argv: list[str] | None = None) -> int:
         if result.get("state") not in ("complete",):
             exit_code = 1
 
+    return finish_run(run_dir, tasks, exit_code)
+
+
+def finish_run(run_dir: Path, tasks: list[str], exit_code: int) -> int:
     summary = write_summary(run_dir, tasks)
     print_summary(summary)
+    return exit_code
+
+
+#: Serialises the derived ``summary.json`` rewrite. Every worker recomputes it
+#: from all of the per-task ``status.json`` files, so two finishing at once
+#: would interleave a read of the set with a write of the whole.
+_SUMMARY_LOCK = threading.Lock()
+
+
+def run_tasks_in_parallel(pending, *, tasks, run_dir, benchmark, env_file,
+                          options, model, env_overrides, judge) -> int:
+    """Run the outstanding tasks N at a time, and report the worst outcome.
+
+    Threads rather than processes: a task is ``docker exec`` waiting on a
+    model, so the work is blocking I/O and the GIL is never the limit. The
+    measured shape of a serial run says the same thing -- 1652 model calls
+    averaging 7.8 seconds each, against containers costing ~240MB idle.
+
+    **The provider is the ceiling, not the machine.** Nothing here can tell
+    what rate the endpoint will accept, so the flag is a dial rather than a
+    guess, and the first sign of having turned it too far is a burst of
+    ``provider_warning`` on tasks that still completed.
+
+    Two stopping rules survive from the serial loop, both meaning "schedule
+    nothing further" rather than "kill what is running": a task killed
+    mid-flight wastes tokens already paid for, and its container would be left
+    behind. In-flight work is always allowed to finish and collect its
+    evidence, which is what keeps the run directory resumable.
+    """
+    order = list(pending)
+    total = len(tasks)
+    stop = threading.Event()
+    exit_code = 0
+    results: dict[str, dict] = {}
+
+    def worker(index: int, task_id: str) -> tuple[str, dict]:
+        if stop.is_set():
+            return task_id, {"state": "skipped"}
+        result = run_one_task(
+            task_id=task_id,
+            task_dir=run_dir / "tasks" / task_id,
+            benchmark=benchmark,
+            env_file=env_file,
+            image=options.image,
+            mode=options.mode,
+            model=model,
+            keep_container=options.keep_container,
+            position=f"{index}/{total}",
+            env_overrides=env_overrides,
+            judge=judge,
+            echo_stream=False,
+        )
+        with _SUMMARY_LOCK:
+            write_summary(run_dir, tasks)
+        return task_id, result
+
+    workers = min(options.concurrency, len(order))
+    print(f"Running {len(order)} tasks {workers} at a time. The live token "
+          f"stream is off: {workers} of them at once is not readable.",
+          flush=True)
+    executor = ThreadPoolExecutor(max_workers=workers,
+                                  thread_name_prefix="hb-task")
+    futures = {executor.submit(worker, index, task_id): task_id
+               for index, task_id in order}
+    try:
+        for future in as_completed(futures):
+            task_id, result = future.result()
+            results[task_id] = result
+            state = result.get("state")
+            if state == "provider_unavailable":
+                if not stop.is_set():
+                    print("Provider quota/credit failure detected; scheduling "
+                          "no further tasks. Tasks already running will finish.",
+                          flush=True)
+                stop.set()
+                exit_code = 75
+            elif state == "interrupted":
+                if not stop.is_set():
+                    print("Interrupted; scheduling no further tasks. Resume "
+                          f"with: --resume {run_dir}", flush=True)
+                stop.set()
+                exit_code = exit_code or 130
+            elif state not in ("complete", "skipped"):
+                exit_code = exit_code or 1
+    except KeyboardInterrupt:
+        # Ctrl+C at the scheduler rather than inside a task. Stop handing out
+        # work and let the running containers tear themselves down; cancelling
+        # the queued futures is what makes that quick.
+        print(f"\nInterrupted; letting running tasks finish. Resume with: "
+              f"--resume {run_dir}", flush=True)
+        stop.set()
+        for future in futures:
+            future.cancel()
+        exit_code = 130
+    finally:
+        executor.shutdown(wait=True)
     return exit_code
 
 
@@ -740,7 +859,8 @@ def open_run(options, tasks, model, metadata, image_id):
 
 
 def run_one_task(*, task_id, task_dir, benchmark, env_file, image, mode, model,
-                 keep_container, position, env_overrides=None, judge=None):
+                 keep_container, position, env_overrides=None, judge=None,
+                 echo_stream=True):
     task_dir.mkdir(parents=True, exist_ok=True)
     write_json(task_dir / "problem.json", snapshot_problem(benchmark, task_id))
     status = {"task_id": task_id, "state": "running", "started_at": time.time(),
@@ -758,7 +878,8 @@ def run_one_task(*, task_id, task_dir, benchmark, env_file, image, mode, model,
             run_container(container, image, env_file, env_overrides)
             copy_into(container, stage, "/work/harnessbench")
             protect_benchmark_assets(container)
-            tail, event_thread = stream_events(container, task_dir / "events.jsonl")
+            tail, event_thread = stream_events(
+                container, task_dir / "events.jsonl", echo=echo_stream)
             print(f"[{position}] {task_id}: running", flush=True)
             command = [
                 docker_exe(), "exec", "-u", "0",
@@ -1109,7 +1230,14 @@ def copy_into(container: str, source: Path, target: str) -> None:
     docker("exec", "-u", "0", container, "chown", "-R", "1000:1000", target)
 
 
-def stream_events(container: str, host_path: Path):
+def stream_events(container: str, host_path: Path, echo: bool = True):
+    """Mirror the container's event log to disk, and optionally to the console.
+
+    ``echo`` is off for a parallel run. The events file is still written --
+    it is evidence, and the exporter reads it -- but the model's token stream
+    is not replayed to stdout, because several of them interleaved character
+    by character is not something anyone can read.
+    """
     host_path.parent.mkdir(parents=True, exist_ok=True)
     command = [docker_exe(), "exec", container, "sh", "-c", "touch /work/live/events.jsonl; tail -n +1 -F /work/live/events.jsonl"]
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace")
@@ -1120,7 +1248,8 @@ def stream_events(container: str, host_path: Path):
             for line in process.stdout:
                 sink.write(line)
                 sink.flush()
-                print_live_event(line)
+                if echo:
+                    print_live_event(line)
 
     thread = threading.Thread(target=copy_lines, daemon=True)
     thread.start()

@@ -202,7 +202,9 @@ DASHBOARD_BODY = """
   <div><label>Plugin profile</label><select id="profile"></select></div>
   <div><label>Permission mode</label><select id="mode"></select></div>
   <div><label>Repeats</label><input type="number" id="repeats" value="1" min="1" max="20"></div>
+  <div><label>Concurrency <span class="muted">tasks at once</span></label><input type="number" id="concurrency" value="1" min="1" max="16"></div>
  </div>
+ <div class="muted" id="concurrencyNote"></div>
  <label>Tasks &mdash; pick difficulties, classes, or a preset</label>
  <div class="chips" id="difficulty"></div>
  <div class="chips" id="class"></div>
@@ -223,7 +225,7 @@ DASHBOARD_BODY = """
  <h2>Jobs</h2>
  <div class="scroll"><table id="jobs"><thead><tr>
   <th>Job</th><th>State</th><th>Model</th><th>Profile</th><th>Mode</th>
-  <th>Repeats</th><th>Trials</th><th>Done</th><th>Notes</th><th></th>
+  <th>Repeats</th><th>At once</th><th>Trials</th><th>Done</th><th>Notes</th><th></th>
  </tr></thead><tbody></tbody></table></div>
 </div>
 """
@@ -258,6 +260,7 @@ function selector(){
   return s;
 }
 async function preview(){
+  note();
   const s = selector();
   if (!Object.keys(s).filter(k => k !== 'exclude').length){
     $('resolved').textContent = 'Nothing selected yet.';
@@ -269,6 +272,17 @@ async function preview(){
   $('resolved').textContent = d.error
     ? d.error
     : `${d.tasks.length} tasks x ${reps} repeats = ${d.tasks.length * reps} trials`;
+}
+// The ceiling is the provider's rate limit, not this machine: a container is
+// ~240MB idle and the work is almost all waiting on the model. So the note
+// warns about quota and readability rather than about RAM.
+function note(){
+  const n = Math.max(1, parseInt($('concurrency').value) || 1);
+  $('concurrencyNote').textContent = n === 1
+    ? 'One task at a time. The live token stream is shown while it runs.'
+    : `${n} tasks at once — roughly ${n}x faster, and the live token stream is `
+      + 'off because that many interleaved is unreadable. The limit is the '
+      + "provider's rate, not this machine; watch for provider warnings.";
 }
 async function load(){
   catalog = await (await fetch('/api/catalog')).json();
@@ -298,7 +312,8 @@ async function load(){
   chips('class', catalog.classes, 'class');
   chips('preset', ['all','pilot','smoke'], 'preset');
   wireChips();
-  ['ids','exclude','repeats'].forEach(id => $(id).oninput = preview);
+  ['ids','exclude','repeats','concurrency'].forEach(id => $(id).oninput = preview);
+  note();
   refresh();
 }
 async function refresh(){
@@ -317,7 +332,8 @@ async function refresh(){
       `</td><td>${esc(j.model)}` +
       (j.judge && j.judge !== 'none' ? ` <span class="muted">judge: ${esc(j.judge)}</span>` : '') +
       `</td><td>${esc(j.profile)}</td><td>${esc(j.mode)}</td>` +
-      `<td>${esc(j.repeats)}</td><td>${esc(j.trial_count)}</td>` +
+      `<td>${esc(j.repeats)}</td><td>${esc(j.concurrency ?? 1)}</td>` +
+      `<td>${esc(j.trial_count)}</td>` +
       `<td>${esc(j.completed)}</td><td class="muted">${esc(j.notes || '')}</td>` +
       `<td>${action}</td></tr>`;
   }).join('') || '<tr><td colspan="10" class="muted">No jobs yet.</td></tr>';
@@ -338,7 +354,9 @@ $('go').onclick = async () => {
   const body = {
     model: $('model').value, judge: $('judge').value,
     profile: $('profile').value, mode: $('mode').value,
-    repeats: parseInt($('repeats').value) || 1, notes: $('notes').value,
+    repeats: parseInt($('repeats').value) || 1,
+    concurrency: parseInt($('concurrency').value) || 1,
+    notes: $('notes').value,
     tasks: selector(),
   };
   const r = await fetch('/api/jobs', {method:'POST', body: JSON.stringify(body)});
@@ -568,6 +586,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     mode=body.get("mode") or "yolo",
                     judge=body.get("judge") or "none",
                     repeats=int(body.get("repeats") or 1),
+                    concurrency=int(body.get("concurrency") or 1),
                     notes=body.get("notes") or "",
                 )
                 return self._json({"job_id": self.runner.start(spec)})

@@ -2,7 +2,9 @@ import importlib.util
 import json
 import shutil
 import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -826,3 +828,109 @@ def test_without_the_override_the_hook_still_refuses() -> None:
             os.environ["HARNESSBENCH_PUBLIC_URL_TEMPLATE"] = previous
         if tunnel_cmd is not None:
             os.environ["HARNESSBENCH_TUNNEL_CMD"] = tunnel_cmd
+
+
+def _parallel_options(concurrency: int):
+    """The handful of ``options`` attributes the scheduler actually reads."""
+    return SimpleNamespace(concurrency=concurrency, image="img", mode="yolo",
+                           keep_container=False)
+
+
+def test_parallel_scheduler_runs_every_task_and_bounds_concurrency(
+        tmp_path: Path, monkeypatch) -> None:
+    """N at a time, all of them, and never more than N containers at once."""
+    import run_harness_bench as runner
+
+    tasks = [f"{n:03d}-task" for n in range(1, 13)]
+    live_now = 0
+    high_water = 0
+    ran: list[str] = []
+    guard = threading.Lock()
+
+    def fake_run_one_task(*, task_id, position, echo_stream=True, **kwargs):
+        nonlocal live_now, high_water
+        assert echo_stream is False, "a parallel run must not echo the stream"
+        with guard:
+            live_now += 1
+            high_water = max(high_water, live_now)
+            ran.append(task_id)
+        time.sleep(0.02)
+        with guard:
+            live_now -= 1
+        return {"state": "complete"}
+
+    monkeypatch.setattr(runner, "run_one_task", fake_run_one_task)
+    monkeypatch.setattr(runner, "write_summary", lambda *a, **k: {})
+
+    code = runner.run_tasks_in_parallel(
+        list(enumerate(tasks, 1)), tasks=tasks, run_dir=tmp_path,
+        benchmark=tmp_path, env_file=tmp_path / "e.env",
+        options=_parallel_options(4), model="m", env_overrides={}, judge=None)
+
+    assert code == 0
+    assert sorted(ran) == sorted(tasks)
+    assert high_water > 1, "nothing actually ran in parallel"
+    assert high_water <= 4, f"ran {high_water} at once with --concurrency 4"
+
+
+def test_parallel_scheduler_stops_scheduling_when_the_provider_gives_out(
+        tmp_path: Path, monkeypatch) -> None:
+    """Quota exhaustion must not spend the rest of the suite.
+
+    In-flight tasks are still allowed to land -- their tokens are already
+    paid for and their containers need tearing down -- so this asserts that
+    the run *stops short*, not that it stops instantly.
+    """
+    import run_harness_bench as runner
+
+    tasks = [f"{n:03d}-task" for n in range(1, 41)]
+    started: list[str] = []
+    guard = threading.Lock()
+
+    def fake_run_one_task(*, task_id, position, echo_stream=True, **kwargs):
+        with guard:
+            started.append(task_id)
+            index = len(started)
+        time.sleep(0.01)
+        return {"state": "provider_unavailable" if index >= 3 else "complete"}
+
+    monkeypatch.setattr(runner, "run_one_task", fake_run_one_task)
+    monkeypatch.setattr(runner, "write_summary", lambda *a, **k: {})
+
+    code = runner.run_tasks_in_parallel(
+        list(enumerate(tasks, 1)), tasks=tasks, run_dir=tmp_path,
+        benchmark=tmp_path, env_file=tmp_path / "e.env",
+        options=_parallel_options(2), model="m", env_overrides={}, judge=None)
+
+    assert code == 75
+    assert len(started) < len(tasks), "the run spent the whole suite anyway"
+
+
+def test_parallel_summary_writes_never_overlap(tmp_path: Path, monkeypatch) -> None:
+    """``summary.json`` is recomputed from every status file, so it needs the lock."""
+    import run_harness_bench as runner
+
+    tasks = [f"{n:03d}-task" for n in range(1, 17)]
+    inside = 0
+    overlapped = False
+
+    def fake_write_summary(*args, **kwargs):
+        nonlocal inside, overlapped
+        inside += 1
+        if inside > 1:
+            overlapped = True
+        time.sleep(0.01)
+        inside -= 1
+        return {}
+
+    monkeypatch.setattr(
+        runner, "run_one_task",
+        lambda **kwargs: {"state": "complete"})
+    monkeypatch.setattr(runner, "write_summary", fake_write_summary)
+
+    runner.run_tasks_in_parallel(
+        list(enumerate(tasks, 1)), tasks=tasks, run_dir=tmp_path,
+        benchmark=tmp_path, env_file=tmp_path / "e.env",
+        options=_parallel_options(8), model="m", env_overrides={}, judge=None)
+
+    assert not overlapped, "two workers rewrote summary.json at once"

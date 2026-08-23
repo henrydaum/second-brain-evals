@@ -78,6 +78,38 @@ python run_harness_bench.py --smoke --mode yolo --execute `
 Add `--retry-failed` only when failed tasks should be attempted again. A run may
 span multiple quota windows; it does not need to complete in one sitting.
 
+### Running tasks in parallel
+
+`--concurrency N` runs N tasks at once. Tasks are already independent — a fresh
+container per task, a unique name, its own staging directory, and no published
+ports — so nothing is shared but the provider and the machine.
+
+```powershell
+python run_harness_bench.py --all --mode yolo --execute --concurrency 4
+```
+
+The work is almost entirely waiting on the model: 1652 calls averaging 7.8s
+against containers costing ~240MB idle. **The provider's rate limit is the
+ceiling, not this machine.** Turn the dial up gradually and watch for
+`provider_warning` on tasks that still completed — that is the first sign of
+having gone too far, and it appears before anything actually fails.
+
+Two behaviours differ above 1:
+
+* The live token stream is suppressed. N of them interleaved character by
+  character is not readable. Events are still written to each task's
+  `events.jsonl`, which is what the exporter reads.
+* Ctrl+C and quota exhaustion both mean *schedule nothing further*, not *kill
+  what is running*. Tasks in flight finish and collect their evidence, so the
+  run directory stays resumable — but the launcher will not exit until they do.
+
+Parallelism costs almost nothing in prompt caching. 96.8% of prompt tokens sit
+on a task's second and later calls, where the cache hit comes from that same
+conversation's previous call — a sequential chain no amount of concurrency
+disturbs. Only the first call of each task (3.2% of tokens, 49.8% cached)
+depends on reuse across tasks, so losing all of it would cost about $0.10 on a
+$3.80 run and move the overall hit rate from 83.8% to 82.2%.
+
 ## Watch the agent
 
 Start the viewer in a second terminal after a run directory has been created:

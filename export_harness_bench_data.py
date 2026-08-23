@@ -55,6 +55,9 @@ SCHEMA: dict[str, dict[str, str]] = {
     "jobs": {
         "job_id": "TEXT PRIMARY KEY", "state": "TEXT", "model": "TEXT",
         "profile": "TEXT", "mode": "TEXT", "judge": "TEXT", "repeats": "INTEGER",
+        # How many tasks ran at once. Scores do not depend on it, but every
+        # wall-clock figure does, so a timing comparison has to group by it.
+        "concurrency": "INTEGER",
         "task_count": "INTEGER", "trial_count": "INTEGER",
         "selector_json": "TEXT", "notes": "TEXT", "created_at": "REAL",
         "updated_at": "REAL", "paused_reason": "TEXT",
@@ -880,6 +883,7 @@ def job_rows(results_root: Path) -> list[dict[str, Any]]:
             "model": spec.get("model"), "profile": spec.get("profile"),
             "mode": spec.get("mode"), "judge": spec.get("judge"),
             "repeats": spec.get("repeats"),
+            "concurrency": spec.get("concurrency") or 1,
             "task_count": len(payload.get("tasks") or []),
             "trial_count": payload.get("trial_count"),
             "selector_json": json_cell(spec.get("tasks")),

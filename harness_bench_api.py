@@ -71,6 +71,11 @@ class JobSpec:
     #: jobs graded by different judges are not comparable.
     judge: str = "none"
     repeats: int = 1
+    #: How many tasks run at once. Recorded on the job because it changes the
+    #: wall-clock numbers and nothing else: scores are per-task and unaffected,
+    #: but comparing "how long did the suite take" across two jobs that ran at
+    #: different concurrencies is comparing two different questions.
+    concurrency: int = 1
     env_file: str = "bench.env"
     image: str = DEFAULT_IMAGE
     notes: str = ""
@@ -90,6 +95,8 @@ class JobSpec:
                              + ", ".join(sorted(MODELS)) + ", or 'none'")
         if self.repeats < 1:
             raise ValueError("repeats must be at least 1")
+        if self.concurrency < 1:
+            raise ValueError("concurrency must be at least 1")
         unknown = sorted(set(self.tasks) - set(SELECTOR_KEYS) - {"exclude"})
         if unknown:
             raise ValueError("unknown task selector key(s): " + ", ".join(unknown)
@@ -210,6 +217,8 @@ class HarnessBenchAPI:
                 command.extend(("--resume", str(run_dir), "--retry-failed"))
             else:
                 command.extend(("--run-id", run_id))
+            if spec.concurrency > 1:
+                command.extend(("--concurrency", str(spec.concurrency)))
             if keep_container:
                 command.append("--keep-container")
             if execute:
@@ -308,6 +317,10 @@ class HarnessBenchAPI:
                 "paused_reason": payload.get("paused_reason"),
                 "model": spec.get("model"), "profile": spec.get("profile"),
                 "mode": spec.get("mode"), "repeats": spec.get("repeats"),
+                # ``or 1`` rather than the bare value: jobs planned before this
+                # field existed have no key, and a blank column would read as
+                # unknown when the answer is definitely one.
+                "concurrency": spec.get("concurrency") or 1,
                 "notes": spec.get("notes"),
             })
         return rows
@@ -384,6 +397,8 @@ def main(argv: list[str] | None = None) -> int:
     new.add_argument("--model", required=True)
     new.add_argument("--profile", default="bench", choices=sorted(PROFILES))
     new.add_argument("--mode", default="yolo", choices=MODES)
+    new.add_argument("--concurrency", type=int, default=1, metavar="N",
+                     help="run N tasks at once (default 1)")
     new.add_argument("--judge", default="none", choices=["none", *sorted(MODELS)],
                      help="model that grades process and security; 'none' pins both to 1.0")
     new.add_argument("--repeats", type=int, default=1)
@@ -428,7 +443,8 @@ def main(argv: list[str] | None = None) -> int:
         result = api.plan(JobSpec(
             model=options.model, profile=options.profile, mode=options.mode,
             judge=options.judge,
-            repeats=options.repeats, env_file=options.env_file,
+            repeats=options.repeats, concurrency=options.concurrency,
+            env_file=options.env_file,
             notes=options.notes,
             tasks={key: value for key, value in selector.items() if value},
         ), job_id=options.job_id).to_dict()
