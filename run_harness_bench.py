@@ -96,6 +96,26 @@ CONTAINER_WORK_ROOT = "/data/Second Brain/workspace/harnessbench-sandboxes"
 #: Seconds reserved out of a task's official timeout for the driver to end its
 #: turn and write its result bundle. See ``stage_benchmark``.
 DRIVER_COLLECT_MARGIN_S = 90
+#: The most of a task's own budget the margin may ever take. A flat 90s was
+#: sized against the 600-3600s tasks that make up almost the whole suite, and
+#: it is nothing to them. Against ``061-periodic-status-rollup``, which
+#: declares ``timeout_sec: 180``, it was half the budget: the agent got 90
+#: seconds for a task whose prompt asks it to poll a directory for at least 25,
+#: and five of six trials in the 2026-08 study died at ``wall_timeout`` around
+#: 93s. Capping the margin proportionally keeps the collection headroom the
+#: constant is for without letting it eat a short task alive.
+DRIVER_COLLECT_MARGIN_FRACTION = 0.25
+
+
+def driver_wall_seconds(timeout_sec: int) -> int:
+    """The agent's share of a task's official timeout.
+
+    Kept as a function so the floor, the margin and the cap are one rule with
+    one place to read it, rather than three constants combined at a call site.
+    """
+    margin = min(DRIVER_COLLECT_MARGIN_S,
+                 int(timeout_sec * DRIVER_COLLECT_MARGIN_FRACTION))
+    return max(30, timeout_sec - margin)
 PROVIDER_PATTERNS = (
     "usage limit reached",
     "quota exceeded",
@@ -1175,7 +1195,7 @@ def stage_benchmark(source: Path, dest: Path, task_id: str, mode: str, model: st
             # ``conv.read``, reading the ledger, and SHA-256'ing every file
             # in the workspace. 30 seconds was cutting it fine on a task with
             # a large output tree.
-            "--wall-seconds", str(max(30, task_timeout(source, task_id) - DRIVER_COLLECT_MARGIN_S)),
+            "--wall-seconds", str(driver_wall_seconds(task_timeout(source, task_id))),
         ],
     }}})
 
@@ -1212,12 +1232,37 @@ def protect_benchmark_assets(container: str) -> None:
         raise RuntimeError(
             "could not make task fixture bytes copyable to the agent: "
             + readable.stderr)
-    # Node is an oracle dependency, not a bundled agent capability. The root
-    # scorer can execute it; Second Brain (UID 1000) cannot and remains free to
-    # install a workspace-local runtime using its own tools.
-    hidden_runtime = docker("exec", "-u", "0", container, "chmod", "700", "/usr/bin/node")
-    if hidden_runtime.returncode:
-        raise RuntimeError("could not reserve Node for the scorer: " + hidden_runtime.stderr)
+    # Node stays executable by the agent, and this used to be ``chmod 700`` on
+    # the reasoning that it is an oracle dependency rather than a bundled agent
+    # capability. That reasoning was wrong twice over.
+    #
+    # It is not ours to withhold. ``041-frontend-state-bug`` says, in the task
+    # text every harness is given: "Make `node .../cartState.test.js` pass."
+    # The benchmark names the interpreter in the instruction, and three tasks
+    # (041, 084, 017) grade JavaScript the same way. The published harnesses
+    # score 70-98% completion on them, so they all had one. Revoking it put us
+    # alone in a different environment and called the difference a result.
+    #
+    # It also bought nothing. The threat a reserved interpreter guards against
+    # is the agent tampering with what the scorer runs, and that needs *write*
+    # access, which UID 1000 has never had here — the file is root-owned. What
+    # ``700`` removed was execute, and the cost of removing it was measured: in
+    # the 2026-08 study 041 spent 25 consecutive shell calls on chmod, cp,
+    # sudo, and ``pip install nodejs-bin`` before giving up, and the fix the
+    # agent had already written correctly was never verified. The escape hatch
+    # in the old comment -- "free to install a workspace-local runtime" -- does
+    # not exist in a network-isolated container.
+    #
+    # Root-owned and non-writable is the property that matters; make it
+    # explicit rather than inheriting whatever the base image shipped.
+    shared_runtime = docker("exec", "-u", "0", container,
+                            "chmod", "755", "/usr/bin/node")
+    if shared_runtime.returncode:
+        raise RuntimeError("could not set Node's mode: " + shared_runtime.stderr)
+    owned_runtime = docker("exec", "-u", "0", container,
+                           "chown", "0:0", "/usr/bin/node")
+    if owned_runtime.returncode:
+        raise RuntimeError("could not confirm Node's owner: " + owned_runtime.stderr)
 
 
 def task_timeout(source: Path, task_id: str) -> int:

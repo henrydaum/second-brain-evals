@@ -20,6 +20,7 @@ from run_harness_bench import (
     CONTAINER_WORK_ROOT,
     DEFAULT_BENCHMARK,
     DRIVER_COLLECT_MARGIN_S,
+    driver_wall_seconds,
     ProviderUnavailableError,
     SELECTIONS,
     assert_ground_truth_reachable,
@@ -180,7 +181,9 @@ def test_stage_uses_generic_cli_and_requested_mode(tmp_path: Path) -> None:
     # The driver must return *and write its bundle* inside the official
     # timeout, because upstream's run-task path does not catch a subprocess
     # timeout: it propagates, no result is written, and the oracle never runs.
-    assert float(model["args"][-1]) == 600.0 - DRIVER_COLLECT_MARGIN_S
+    assert float(model["args"][-1]) == driver_wall_seconds(600)
+    # Unchanged for a task this size: the margin only shrinks on short tasks.
+    assert driver_wall_seconds(600) == 600.0 - DRIVER_COLLECT_MARGIN_S
     app = json.loads((stage / "config" / "app.json").read_text(encoding="utf-8"))
     assert app["work_root"] == CONTAINER_WORK_ROOT
     assert app["work_root"].startswith("/data/Second Brain/workspace/")
@@ -934,3 +937,40 @@ def test_parallel_summary_writes_never_overlap(tmp_path: Path, monkeypatch) -> N
         options=_parallel_options(8), model="m", env_overrides={}, judge=None)
 
     assert not overlapped, "two workers rewrote summary.json at once"
+
+
+def test_a_short_task_keeps_most_of_its_own_budget() -> None:
+    """The margin is collection headroom, not a share of the task.
+
+    ``061-periodic-status-rollup`` declares ``timeout_sec: 180`` and asks the
+    agent to poll a directory for at least 25 seconds. A flat 90-second margin
+    left it 90 seconds to do that in, and five of six trials in the 2026-08
+    study died at ``wall_timeout`` around 93s. The margin was sized against the
+    600-3600s tasks that are almost the whole suite; capping it proportionally
+    is what keeps it from eating a short task alive.
+    """
+    assert driver_wall_seconds(180) == 135
+    # Never below the floor, however small the task claims to be.
+    assert driver_wall_seconds(20) == 30
+
+
+def test_the_margin_is_unchanged_for_every_long_task() -> None:
+    """The fix must be surgical: 061 is the only task in the suite under a
+    200-second driver budget, and no other task's budget may move."""
+    for timeout in (420, 540, 600, 700, 720, 750, 800, 900, 1000, 1200, 1800,
+                    2400, 3600):
+        assert driver_wall_seconds(timeout) == timeout - DRIVER_COLLECT_MARGIN_S
+
+
+def test_node_stays_executable_for_the_agent() -> None:
+    """Three tasks grade JavaScript and 041's prompt names the interpreter:
+    "Make `node .../cartState.test.js` pass." Every published harness scores
+    70-98% completion on them, so reserving Node for the scorer put us alone in
+    a different environment. Root ownership is what stops tampering; execute
+    permission was never the control.
+    """
+    source = Path("run_harness_bench.py").read_text(encoding="utf-8")
+
+    assert '"chmod", "700", "/usr/bin/node"' not in source
+    assert '"chmod", "755", "/usr/bin/node"' in source
+    assert '"chown", "0:0", "/usr/bin/node"' in source
