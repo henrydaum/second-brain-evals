@@ -1,3 +1,7 @@
+# Source Agent
+
+The source for the agent framework used in this repo is found [here](https://github.com/henrydaum/second-brain).
+
 # Second Brain Evals
 
 This repository measures Second Brain as an agent framework. Its first supported
